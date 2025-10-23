@@ -13,6 +13,8 @@ find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(message_filters REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBCAMERA REQUIRED IMPORTED_TARGET libcamera)
 
 # Find OpenCV
 find_package(OpenCV REQUIRED)
@@ -21,15 +23,11 @@ find_package(OpenCV REQUIRED)
 include_directories(
   include
   ${OpenCV_INCLUDE_DIRS}
+  ${LIBCAMERA_INCLUDE_DIRS}
 )
 
 # Camera Node
-add_executable(camera_node src/camera_node.cpp)
-ament_target_dependencies(camera_node
-  rclcpp
-  sensor_msgs
-)
-target_link_libraries(camera_node ${OpenCV_LIBS})
+
 
 # IMU Camera Sync Node
 add_executable(imu_camera_sync_node src/imu_camera_sync_node.cpp)
@@ -45,15 +43,13 @@ ament_target_dependencies(camera_test
   rclcpp
   sensor_msgs
 )
-target_link_libraries(camera_test ${OpenCV_LIBS})
+target_link_libraries(camera_test
+  ${OpenCV_LIBS}
+  PkgConfig::LIBCAMERA
+)
 
 # Install executables
-install(TARGETS
-  camera_node
-  imu_camera_sync_node
-  camera_test
-  DESTINATION lib/${PROJECT_NAME}
-)
+
 
 # Install Python scripts
 install(PROGRAMS

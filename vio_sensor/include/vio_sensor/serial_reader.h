@@ -39,6 +39,9 @@ public:
     // Check if time calibration is complete
     bool is_calibrated() const { return time_offset_initialized_; }
 
+    // Convert Pico time (microseconds) to ROS time
+    rclcpp::Time pico_to_ros_time(uint32_t pico_us) const;
+
 private:
     // Serial port operations
     bool open_serial();
@@ -50,7 +53,6 @@ private:
 
     // Time synchronization
     void initialize_time_offset(uint32_t pico_us);
-    rclcpp::Time pico_to_ros_time(uint32_t pico_us) const;
     int64_t calculate_median(std::vector<int64_t>& samples);
 
     // CRC validation

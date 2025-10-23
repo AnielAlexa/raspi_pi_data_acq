@@ -78,10 +78,8 @@ private:
   std::mutex trigger_mutex_;
   std::unordered_map<uint16_t, rclcpp::Time> trigger_map_;  // frame_id -> timestamp
   size_t max_trigger_map_size_;
-  rclcpp::Time latest_trigger_time_;  // Temporary storage for pairing
-  uint16_t latest_frame_id_;          // Temporary storage for pairing
-  bool has_pending_time_;
-  bool has_pending_id_;
+  rclcpp::Time latest_trigger_time_;  // Latest trigger timestamp for fallback
+  uint16_t latest_frame_id_;          // Latest trigger frame_id for matching
 
   // Camera parameters
   int camera_index_;

@@ -17,9 +17,7 @@ CameraComponent::CameraComponent(const rclcpp::NodeOptions & options)
   height_(0),
   stride_(0),
   max_trigger_map_size_(20),
-  latest_frame_id_(0),
-  has_pending_time_(false),
-  has_pending_id_(false)
+  latest_frame_id_(0)
 {
   // --- Parameters ---
   camera_index_   = this->declare_parameter<int>("camera_index", 0);
@@ -35,9 +33,14 @@ CameraComponent::CameraComponent(const rclcpp::NodeOptions & options)
   camera_info_pub_ = this->create_publisher<sensor_msgs::msg::CameraInfo>(
       "/camera/camera_info", rclcpp::QoS(10));
 
-  // (Triggers commented out for test mode)
-  // trigger_sub_ = ...
-  // frame_id_sub_ = ...
+  // --- Subscribers for synchronized trigger events ---
+  trigger_sub_ = this->create_subscription<std_msgs::msg::Header>(
+      "/sync/trigger_time_ros", rclcpp::QoS(10),
+      std::bind(&CameraComponent::triggerTimeCallback, this, std::placeholders::_1));
+  frame_id_sub_ = this->create_subscription<std_msgs::msg::UInt16>(
+      "/sync/trigger_frame_id", rclcpp::QoS(10),
+      std::bind(&CameraComponent::triggerFrameIdCallback, this, std::placeholders::_1));
+  RCLCPP_INFO(this->get_logger(), "Subscribed to /sync/trigger_* for frame synchronization");
 
   if (!initCamera()) {
     RCLCPP_ERROR(this->get_logger(), "Failed to initialize camera");
@@ -230,32 +233,24 @@ void CameraComponent::triggerTimeCallback(const std_msgs::msg::Header::SharedPtr
 {
   std::lock_guard<std::mutex> lock(trigger_mutex_);
   latest_trigger_time_ = rclcpp::Time(msg->stamp);
-  has_pending_time_ = true;
-
-  if (has_pending_time_ && has_pending_id_) {
-    trigger_map_[latest_frame_id_] = latest_trigger_time_;
-    has_pending_time_ = has_pending_id_ = false;
-
-    if (trigger_map_.size() > max_trigger_map_size_) {
-      auto it = trigger_map_.begin();
-      for (int i = 0; i < 5 && it != trigger_map_.end(); ++i) it = trigger_map_.erase(it);
-    }
-  }
+  RCLCPP_DEBUG(this->get_logger(), "Trigger time received: %.3f", latest_trigger_time_.seconds());
 }
 
 void CameraComponent::triggerFrameIdCallback(const std_msgs::msg::UInt16::SharedPtr msg)
 {
   std::lock_guard<std::mutex> lock(trigger_mutex_);
   latest_frame_id_ = msg->data;
-  has_pending_id_ = true;
 
-  if (has_pending_time_ && has_pending_id_) {
-    trigger_map_[latest_frame_id_] = latest_trigger_time_;
-    has_pending_time_ = has_pending_id_ = false;
+  // Store mapping of frame_id to latest trigger time
+  trigger_map_[latest_frame_id_] = latest_trigger_time_;
+  RCLCPP_DEBUG(this->get_logger(), "Trigger frame_id received: %u, stored with time %.3f",
+               latest_frame_id_, latest_trigger_time_.seconds());
 
-    if (trigger_map_.size() > max_trigger_map_size_) {
-      auto it = trigger_map_.begin();
-      for (int i = 0; i < 5 && it != trigger_map_.end(); ++i) it = trigger_map_.erase(it);
+  // Clean up old entries to prevent unbounded growth
+  if (trigger_map_.size() > max_trigger_map_size_) {
+    auto it = trigger_map_.begin();
+    for (size_t i = 0; i < 5 && it != trigger_map_.end(); ++i) {
+      it = trigger_map_.erase(it);
     }
   }
 }
@@ -264,15 +259,36 @@ void CameraComponent::onRequestCompleted(libcamera::Request * req)
 {
   if (req->status() == libcamera::Request::RequestCancelled) return;
 
-  // Get trigger timestamp from Pico (synchronized)
+  // Get frame sequence number from libcamera (should match Pico's frame_id)
+  uint64_t frame_sequence = req->sequence();
+
+  // Match completed frame to trigger using frame_id
   rclcpp::Time stamp;
   {
     std::lock_guard<std::mutex> lock(trigger_mutex_);
-    stamp = latest_trigger_time_;
+
+    // Cast sequence to uint16_t to match against trigger map
+    uint16_t frame_id = static_cast<uint16_t>(frame_sequence & 0xFFFF);
+
+    // Try to find matching trigger by frame sequence
+    auto it = trigger_map_.find(frame_id);
+    if (it != trigger_map_.end()) {
+      stamp = it->second;
+      RCLCPP_DEBUG(this->get_logger(),
+                   "Frame seq=%lu (id=%u) matched to trigger with timestamp",
+                   frame_sequence, frame_id);
+    } else {
+      // Fallback to latest trigger if no exact match found
+      stamp = latest_trigger_time_;
+      RCLCPP_WARN(this->get_logger(),
+                  "No trigger match for frame seq=%lu (id=%u), using latest timestamp",
+                  frame_sequence, frame_id);
+    }
   }
 
-  // Fallback to current time if no trigger received yet
+  // Final fallback to current time if still no timestamp
   if (stamp.nanoseconds() == 0) {
+    RCLCPP_WARN(this->get_logger(), "No synchronized timestamp available for frame %lu, using wall clock", frame_sequence);
     stamp = this->now();
   }
 
