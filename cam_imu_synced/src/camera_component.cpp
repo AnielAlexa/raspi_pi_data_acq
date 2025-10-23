@@ -264,8 +264,17 @@ void CameraComponent::onRequestCompleted(libcamera::Request * req)
 {
   if (req->status() == libcamera::Request::RequestCancelled) return;
 
-  // TEST MODE: no sync, use now()
-  rclcpp::Time stamp = this->now();
+  // Get trigger timestamp from Pico (synchronized)
+  rclcpp::Time stamp;
+  {
+    std::lock_guard<std::mutex> lock(trigger_mutex_);
+    stamp = latest_trigger_time_;
+  }
+
+  // Fallback to current time if no trigger received yet
+  if (stamp.nanoseconds() == 0) {
+    stamp = this->now();
+  }
 
   // Locate buffer
   const auto & buffers_map = req->buffers();
@@ -282,19 +291,29 @@ void CameraComponent::onRequestCompleted(libcamera::Request * req)
       goto requeue;
     }
 
-    // --- Row-by-row copy to drop padding and keep ROS buffer compact ---
-    // libcamera plane 0: stride_ bytes per row; ROS msg: step = width_*3 per row
-    const uint8_t *src = static_cast<const uint8_t*>(mit->second.planes[0].addr);
+    auto img_msg = std::make_unique<sensor_msgs::msg::Image>();
+    img_msg->header.stamp   = stamp;
+    img_msg->header.frame_id= camera_frame_id_;
+    img_msg->width          = width_;
+    img_msg->height         = height_;
+    img_msg->encoding       = "rgb8";
+    img_msg->is_bigendian   = false;
+    img_msg->step           = static_cast<uint32_t>(width_ * 3);
+
+    // Allocate exact compact size once per message
     const size_t dst_step = static_cast<size_t>(width_) * 3;
-    const size_t src_step = static_cast<size_t>(stride_);
-    uint8_t *dst = img_msg_template_.data.data();
-    for (int r = 0; r < height_; ++r) {
+    img_msg->data.resize(dst_step * static_cast<size_t>(height_));
+
+    // Row-by-row copy from libcamera stride_ → compact ROS buffer
+    const uint8_t *src   = static_cast<const uint8_t*>(mit->second.planes[0].addr);
+    const size_t   src_step = static_cast<size_t>(stride_);
+    uint8_t *dst     = img_msg->data.data();
+    for (size_t r = 0; r < static_cast<size_t>(height_); ++r) {
       std::memcpy(dst + r * dst_step, src + r * src_step, dst_step);
     }
 
-    // Build a message from the template (no new allocations; capacity stays)
-    auto img_msg = std::make_unique<sensor_msgs::msg::Image>(img_msg_template_);
-    img_msg->header.stamp = stamp;         // only stamp changes
+
+       // only stamp changes
     image_pub_->publish(std::move(img_msg));
 
     // CameraInfo with same stamp
