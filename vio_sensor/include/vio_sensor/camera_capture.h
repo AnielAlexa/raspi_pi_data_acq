@@ -1,6 +1,6 @@
 /**
  * @file camera_capture.h
- * @brief libcamera-based camera capture with zero-copy access
+ * @brief libcamera-based camera capture with zero-copy access (reusable messages)
  */
 
 #ifndef VIO_SENSOR_CAMERA_CAPTURE_H
@@ -13,38 +13,27 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 
-#include <memory>
 #include <functional>
+#include <memory>
 #include <unordered_map>
 #include <vector>
-#include <mutex>
-#include <condition_variable>
 
 namespace vio_sensor {
 
-struct MappedPlane {
-    void* addr = nullptr;
-    size_t length = 0;
-};
-
-struct MappedBuffer {
-    std::vector<MappedPlane> planes;
-};
+struct MappedPlane { void* addr=nullptr; size_t length=0; };
+struct MappedBuffer { std::vector<MappedPlane> planes; };
 
 class CameraCapture {
 public:
-    using FrameCallback = std::function<void(const sensor_msgs::msg::Image&,
-                                             const sensor_msgs::msg::CameraInfo&)>;
+    using FrameCallback = std::function<void(
+        sensor_msgs::msg::Image&, sensor_msgs::msg::CameraInfo&)>;
 
-    CameraCapture(rclcpp::Node* node, FrameCallback callback);
+    CameraCapture(rclcpp::Node* node, FrameCallback cb);
     ~CameraCapture();
 
-    // Initialize and start camera
-    bool init(int width = 640, int height = 480);
+    bool init(int width=640, int height=480);
     void start();
     void stop();
-
-    // Process camera events (call from main loop)
     void process_events();
 
 private:
@@ -53,28 +42,25 @@ private:
     rclcpp::Node* node_;
     FrameCallback frame_callback_;
 
-    // libcamera objects
     std::unique_ptr<libcamera::CameraManager> camera_manager_;
     std::shared_ptr<libcamera::Camera> camera_;
     std::unique_ptr<libcamera::CameraConfiguration> config_;
     std::unique_ptr<libcamera::FrameBufferAllocator> allocator_;
-    libcamera::Stream* stream_;
+    libcamera::Stream* stream_{nullptr};
 
-    // Memory mapped buffers
     std::unordered_map<libcamera::FrameBuffer*, MappedBuffer> mappings_;
-
-    // Request pool
     std::vector<std::unique_ptr<libcamera::Request>> requests_;
 
-    // Camera configuration
-    int width_;
-    int height_;
-    std::string camera_frame_id_;
+    int width_{640};
+    int height_{480};
+    std::string camera_frame_id_{"camera"};
+    bool running_{false};
 
-    // Running state
-    bool running_;
+    // Reusable preallocated messages
+    sensor_msgs::msg::Image img_msg_;
+    sensor_msgs::msg::CameraInfo info_msg_;
 };
 
-}  // namespace vio_sensor
+} // namespace vio_sensor
 
-#endif  // VIO_SENSOR_CAMERA_CAPTURE_H
+#endif
