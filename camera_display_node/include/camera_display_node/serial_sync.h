@@ -24,7 +24,7 @@ namespace camera_display_node {
 
 struct ImuPacket {
     uint16_t header;        // 0xAA55
-    uint32_t timestamp_us;  // Microseconds since Pico boot
+    uint64_t timestamp_us;  // Microseconds since Pico boot
     float ax, ay, az;       // Linear acceleration (m/s²)
     float gx, gy, gz;       // Angular velocity (rad/s)
     uint16_t crc16;         // CRC checksum
@@ -32,7 +32,7 @@ struct ImuPacket {
 
 struct TriggerPacket {
     uint16_t header;        // 0xBB66
-    uint32_t timestamp_us;  // Microseconds when camera trigger fired
+    uint64_t timestamp_us;  // Microseconds when camera trigger fired
     uint16_t frame_id;      // Frame counter
     uint16_t reserved;      // Reserved for future use
     uint16_t crc16;         // CRC checksum
