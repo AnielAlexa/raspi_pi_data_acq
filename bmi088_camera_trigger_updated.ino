@@ -25,7 +25,7 @@ Bmi088 bmi(SPI, PIN_CS_ACCEL, PIN_CS_GYRO);
 // IMU Packet structure (32 bytes)
 struct __attribute__((packed)) ImuPacket {
   uint16_t header;        // 0xAA55
-  uint32_t timestamp_us;  // Microseconds
+  uint64_t timestamp_us;  // Microseconds
   float ax, ay, az;       // m/s²
   float gx, gy, gz;       // rad/s
   uint16_t crc16;         // CRC checksum
@@ -34,7 +34,7 @@ struct __attribute__((packed)) ImuPacket {
 // NEW: Camera Trigger Packet structure (12 bytes)
 struct __attribute__((packed)) TriggerPacket {
   uint16_t header;        // 0xBB66 (different from IMU)
-  uint32_t timestamp_us;  // Microseconds when trigger fired
+  uint64_t timestamp_us;  // Microseconds when trigger fired
   uint16_t frame_id;      // Frame counter
   uint16_t reserved;      // Reserved for alignment
   uint16_t crc16;         // CRC checksum
