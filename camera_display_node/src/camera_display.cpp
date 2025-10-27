@@ -9,9 +9,82 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstring>
 #include <iostream>
 #include <rclcpp/executors/multi_threaded_executor.hpp>
+
+namespace {
+
+size_t planeHeightForFormat(const libcamera::PixelFormat & format,
+                            size_t plane_index,
+                            size_t full_height) {
+    if (format == libcamera::formats::YUV420) {
+        return plane_index == 0 ? full_height : full_height / 2;
+    }
+    return full_height;
+}
+
+uint8_t clampToByte(int value) {
+    return static_cast<uint8_t>(std::clamp(value, 0, 255));
+}
+
+bool convertYuv420ToRgb(const MappedBuffer & buffer,
+                        size_t width,
+                        size_t height,
+                        uint8_t * dst,
+                        size_t dst_step,
+                        const rclcpp::Logger & logger) {
+    if (buffer.planes.size() < 3) {
+        RCLCPP_ERROR(logger, "YUV420 buffer missing planes (%zu)", buffer.planes.size());
+        return false;
+    }
+
+    const auto * y_plane = static_cast<const uint8_t *>(buffer.planes[0].addr);
+    const auto * u_plane = static_cast<const uint8_t *>(buffer.planes[1].addr);
+    const auto * v_plane = static_cast<const uint8_t *>(buffer.planes[2].addr);
+
+    const size_t stride_y = buffer.planes[0].stride;
+    const size_t stride_u = buffer.planes[1].stride;
+    const size_t stride_v = buffer.planes[2].stride;
+
+    if (stride_y == 0 || stride_u == 0 || stride_v == 0) {
+        RCLCPP_ERROR(logger, "Invalid plane stride (Y=%zu, U=%zu, V=%zu)",
+                     stride_y, stride_u, stride_v);
+        return false;
+    }
+
+    for (size_t row = 0; row < height; ++row) {
+        const uint8_t * y_row = y_plane + row * stride_y;
+        const uint8_t * u_row = u_plane + (row / 2) * stride_u;
+        const uint8_t * v_row = v_plane + (row / 2) * stride_v;
+        uint8_t * dst_row = dst + row * dst_step;
+
+        for (size_t col = 0; col < width; ++col) {
+            const size_t uv_col = col / 2;
+
+            int Y = static_cast<int>(y_row[col]) - 16;
+            int U = static_cast<int>(u_row[uv_col]) - 128;
+            int V = static_cast<int>(v_row[uv_col]) - 128;
+
+            if (Y < 0) {
+                Y = 0;
+            }
+
+            int R = (298 * Y + 409 * V + 128) >> 8;
+            int G = (298 * Y - 100 * U - 208 * V + 128) >> 8;
+            int B = (298 * Y + 516 * U + 128) >> 8;
+
+            dst_row[3 * col + 0] = clampToByte(R);
+            dst_row[3 * col + 1] = clampToByte(G);
+            dst_row[3 * col + 2] = clampToByte(B);
+        }
+    }
+
+    return true;
+}
+
+}  // namespace
 
 // ============================================================
 // Constructor
@@ -149,9 +222,47 @@ bool CameraDisplayNode::initCamera() {
     height_ = stream_cfg.size.height;
     stride_ = stream_cfg.stride;
     stream_ = stream_cfg.stream();
+    pixel_format_ = stream_cfg.pixelFormat;
 
     RCLCPP_INFO(this->get_logger(), "Configured: %dx%d stride=%d format=%s",
-                width_, height_, stride_, stream_cfg.pixelFormat.toString().c_str());
+                width_, height_, stride_, pixel_format_.toString().c_str());
+
+    if (pixel_format_ != libcamera::formats::RGB888) {
+        RCLCPP_WARN(this->get_logger(),
+                    "Camera provided pixel format %s (requested RGB888)",
+                    pixel_format_.toString().c_str());
+    }
+
+    if (pixel_format_ == libcamera::formats::RGB888) {
+        requires_conversion_ = false;
+        image_encoding_ = "rgb8";
+        bytes_per_pixel_ = 3;
+    } else if (pixel_format_ == libcamera::formats::BGR888) {
+        requires_conversion_ = false;
+        image_encoding_ = "bgr8";
+        bytes_per_pixel_ = 3;
+    } else if (pixel_format_ == libcamera::formats::R8) {
+        requires_conversion_ = false;
+        image_encoding_ = "mono8";
+        bytes_per_pixel_ = 1;
+    } else if (pixel_format_ == libcamera::formats::YUV420) {
+        requires_conversion_ = true;
+        image_encoding_ = "rgb8";
+        bytes_per_pixel_ = 3;
+        RCLCPP_INFO(this->get_logger(),
+                    "Pixel format %s requires conversion to %s",
+                    pixel_format_.toString().c_str(), image_encoding_.c_str());
+    } else {
+        RCLCPP_FATAL(this->get_logger(),
+                     "Unsupported pixel format negotiated: %s",
+                     pixel_format_.toString().c_str());
+        return false;
+    }
+
+    if (bytes_per_pixel_ == 0) {
+        RCLCPP_FATAL(this->get_logger(), "Invalid bytes-per-pixel negotiated");
+        return false;
+    }
 
     // Allocate frame buffers
     allocator_ = std::make_unique<libcamera::FrameBufferAllocator>(camera_);
@@ -179,7 +290,39 @@ bool CameraDisplayNode::initCamera() {
                 RCLCPP_ERROR(this->get_logger(), "mmap failed on plane %zu", p);
                 return false;
             }
-            mb.planes[p] = { addr, pl.length };
+            MappedPlane plane;
+            plane.addr = addr;
+            plane.length = pl.length;
+
+            const size_t plane_height = planeHeightForFormat(pixel_format_, p, height_);
+            if (plane_height == 0) {
+                RCLCPP_ERROR(this->get_logger(),
+                             "Plane %zu has zero height for format %s",
+                             p, pixel_format_.toString().c_str());
+                return false;
+            }
+
+            if (p == 0 && stride_ != 0) {
+                plane.stride = stride_;
+            } else {
+                plane.stride = plane.length / plane_height;
+            }
+
+            if (plane.stride == 0) {
+                RCLCPP_ERROR(this->get_logger(),
+                             "Computed zero stride for plane %zu (len=%zu, height=%zu)",
+                             p, plane.length, plane_height);
+                return false;
+            }
+
+            const size_t expected_length = plane.stride * plane_height;
+            if (expected_length != plane.length) {
+                RCLCPP_WARN(this->get_logger(),
+                            "Plane %zu length mismatch: expected %zu, got %zu",
+                            p, expected_length, plane.length);
+            }
+
+            mb.planes[p] = plane;
         }
         mappings_.emplace(fb, std::move(mb));
     }
@@ -415,8 +558,6 @@ void CameraDisplayNode::onRequestCompleted(libcamera::Request * req) {
             goto requeue;
         }
 
-        const uint8_t * src = static_cast<const uint8_t*>(mit->second.planes[0].addr);
-
         // --- FPS Calculation ---
         auto now = std::chrono::steady_clock::now();
         double dt = std::chrono::duration<double>(now - last_frame_time_).count();
@@ -475,17 +616,55 @@ void CameraDisplayNode::onRequestCompleted(libcamera::Request * req) {
         img_msg->header.frame_id = "camera_link";
         img_msg->width  = width_;
         img_msg->height = height_;
-        img_msg->encoding = "rgb8";
+        img_msg->encoding = image_encoding_;
         img_msg->is_bigendian = false;
-        img_msg->step = width_ * 3;
+        img_msg->step = static_cast<uint32_t>(width_) * static_cast<uint32_t>(bytes_per_pixel_);
 
-        // Copy frame data to ROS message (compact, no padding)
-        const size_t dst_step = static_cast<size_t>(width_) * 3;
+        if (img_msg->step == 0) {
+            RCLCPP_ERROR(this->get_logger(), "Image step resolved to zero for format %s",
+                         pixel_format_.toString().c_str());
+            goto requeue;
+        }
+
+        const size_t dst_step = static_cast<size_t>(img_msg->step);
         img_msg->data.resize(dst_step * static_cast<size_t>(height_));
 
         uint8_t * dst = img_msg->data.data();
-        for (size_t r = 0; r < static_cast<size_t>(height_); ++r) {
-            std::memcpy(dst + r * dst_step, src + r * stride_, dst_step);
+
+        const MappedBuffer & mapped = mit->second;
+        if (requires_conversion_) {
+            bool converted = false;
+            if (pixel_format_ == libcamera::formats::YUV420) {
+                converted = convertYuv420ToRgb(mapped, width_, height_, dst, dst_step,
+                                               this->get_logger());
+            }
+
+            if (!converted) {
+                RCLCPP_ERROR(this->get_logger(),
+                             "Failed to convert frame from pixel format %s",
+                             pixel_format_.toString().c_str());
+                goto requeue;
+            }
+        } else {
+            if (mapped.planes.empty() || mapped.planes[0].addr == nullptr) {
+                RCLCPP_ERROR(this->get_logger(), "Primary plane mapping missing");
+                goto requeue;
+            }
+
+            const uint8_t * src = static_cast<const uint8_t *>(mapped.planes[0].addr);
+            const size_t src_stride = mapped.planes[0].stride != 0 ?
+                                      mapped.planes[0].stride : stride_;
+
+            if (src_stride == 0) {
+                RCLCPP_ERROR(this->get_logger(),
+                             "Source stride resolved to zero for format %s",
+                             pixel_format_.toString().c_str());
+                goto requeue;
+            }
+
+            for (size_t r = 0; r < static_cast<size_t>(height_); ++r) {
+                std::memcpy(dst + r * dst_step, src + r * src_stride, dst_step);
+            }
         }
 
         image_pub_->publish(std::move(img_msg));

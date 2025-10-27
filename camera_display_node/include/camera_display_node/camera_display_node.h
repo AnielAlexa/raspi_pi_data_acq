@@ -19,12 +19,14 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
 struct MappedPlane {
     void *addr = nullptr;
     size_t length = 0;
+    size_t stride = 0;
 };
 
 struct MappedBuffer {
@@ -75,6 +77,10 @@ private:
 
     libcamera::Stream *stream_;
     unsigned int stride_;
+    libcamera::PixelFormat pixel_format_;
+    bool requires_conversion_ = false;
+    std::string image_encoding_;
+    size_t bytes_per_pixel_ = 0;
 
     // ============================================================
     // FPS Tracking
