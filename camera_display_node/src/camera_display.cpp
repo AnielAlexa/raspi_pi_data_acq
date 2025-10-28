@@ -26,9 +26,9 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
 {
     // Declare parameters
     camera_index_ = this->declare_parameter<int>("camera_index", 0);
-    width_ = this->declare_parameter<int>("width", 640);
-    height_ = this->declare_parameter<int>("height", 480);
-    std::string serial_port = this->declare_parameter<std::string>("serial_port", "/dev/ttyACM0");
+    width_ = this->declare_parameter<int>("width", 728);
+    height_ = this->declare_parameter<int>("height", 544);
+    std::string serial_port = this->declare_parameter<std::string>("serial_port", "/dev/ttyAMA0");
     enable_pico_sync_ = this->declare_parameter<bool>("enable_pico_sync", true);
 
     // Create publishers
@@ -132,7 +132,7 @@ bool CameraDisplayNode::initCamera() {
     }
 
     libcamera::StreamConfiguration & stream_cfg = config->at(0);
-    stream_cfg.pixelFormat = libcamera::formats::RGB888;
+    stream_cfg.pixelFormat = libcamera::formats::BGR888;
     stream_cfg.size.width  = width_;
     stream_cfg.size.height = height_;
 
@@ -475,7 +475,7 @@ void CameraDisplayNode::onRequestCompleted(libcamera::Request * req) {
         img_msg->header.frame_id = "camera_link";
         img_msg->width  = width_;
         img_msg->height = height_;
-        img_msg->encoding = "rgb8";
+        img_msg->encoding = "bgr8";
         img_msg->is_bigendian = false;
         img_msg->step = width_ * 3;
 

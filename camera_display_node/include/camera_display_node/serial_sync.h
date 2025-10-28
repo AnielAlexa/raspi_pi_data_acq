@@ -43,7 +43,7 @@ struct TriggerPacket {
 // Packet header constants
 constexpr uint16_t IMU_HEADER = 0xAA55;
 constexpr uint16_t TRIGGER_HEADER = 0xBB66;
-constexpr int SERIAL_BAUDRATE = 921600;
+constexpr int SERIAL_BAUDRATE = 230400;
 constexpr size_t TIME_OFFSET_SAMPLES = 100;
 
 class SerialSync {

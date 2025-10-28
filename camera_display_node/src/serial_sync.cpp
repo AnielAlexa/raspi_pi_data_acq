@@ -71,8 +71,8 @@ bool SerialSync::open_serial()
     }
 
     // Set baud rate
-    cfsetospeed(&tty, B921600);
-    cfsetispeed(&tty, B921600);
+    cfsetospeed(&tty, B230400);
+    cfsetispeed(&tty, B230400);
 
     // 8N1 mode, no flow control
     tty.c_cflag &= ~PARENB;

@@ -3,6 +3,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <opencv2/opencv.hpp>
 
 #include <chrono>
 #include <deque>
@@ -34,6 +35,24 @@ public:
 private:
     void imageCallback(const sensor_msgs::msg::Image::SharedPtr msg) {
         auto now = std::chrono::steady_clock::now();
+
+        // Convert ROS image to OpenCV Mat and display it
+        try {
+            int cv_type = CV_8UC3; // Default to BGR8
+            
+            // Create Mat from ROS image data
+            cv::Mat frame(msg->height, msg->width, cv_type, const_cast<uint8_t*>(msg->data.data()), msg->step);
+            
+            // If encoding is bgr8, convert to RGB for correct display
+            if (msg->encoding == "bgr8") {
+                cv::cvtColor(frame, frame, cv::COLOR_BGR2RGB);
+            }
+            
+            cv::imshow("Camera Frame", frame);
+            cv::waitKey(1);  // Process GUI events
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(this->get_logger(), "Error displaying image: %s", e.what());
+        }
 
         // Calculate time since last frame
         if (frame_times_.size() > 0) {
