@@ -90,11 +90,11 @@ private:
     bool enable_pico_sync_;
     std::unique_ptr<camera_display_node::SerialSync> serial_sync_;
 
+    size_t trigger_map_max_size_;
+    std::atomic<uint16_t> expected_frame_id_;
     std::mutex trigger_map_mutex_;
     std::unordered_map<uint16_t, rclcpp::Time> trigger_map_;  // frame_id → timestamp
     rclcpp::Time latest_trigger_time_;                         // Latest trigger timestamp for sync
-    size_t trigger_map_max_size_;
-    std::atomic<uint16_t> expected_frame_id_;
 
     // ============================================================
     // Synchronization Statistics
@@ -102,6 +102,13 @@ private:
     std::atomic<uint32_t> frames_received_;
     std::atomic<uint32_t> frames_matched_;
     std::atomic<uint32_t> frame_drops_;
+
+    // ============================================================
+    // Performance Metrics
+    // ============================================================
+    double callback_time_us_;
+    double memcpy_time_us_;
+    std::atomic<uint32_t> slow_callbacks_;  // Count of callbacks > 5ms
 };
 
 #endif  // CAMERA_DISPLAY_NODE_CAMERA_DISPLAY_NODE_H

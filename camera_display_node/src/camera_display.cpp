@@ -54,6 +54,11 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     smoothed_fps_ = 0.0;
     frames_since_log_ = 0;
 
+    // Initialize performance metrics
+    callback_time_us_ = 0.0;
+    memcpy_time_us_ = 0.0;
+    slow_callbacks_ = 0;
+
     // Initialize Pico serial synchronization if enabled
     if (enable_pico_sync_) {
         initPicoSync(serial_port);
@@ -350,6 +355,9 @@ void CameraDisplayNode::logSyncStats() {
     RCLCPP_INFO(this->get_logger(), "Total frames received: %u", frames_received_.load());
     RCLCPP_INFO(this->get_logger(), "Frames matched to trigger: %u", frames_matched_.load());
     RCLCPP_INFO(this->get_logger(), "Frame drops detected: %u", frame_drops_.load());
+    RCLCPP_INFO(this->get_logger(), "Slow callbacks (>5ms): %u", slow_callbacks_.load());
+    RCLCPP_INFO(this->get_logger(), "Last callback duration: %.1f µs (memcpy: %.1f µs)",
+               callback_time_us_, memcpy_time_us_);
 
     uint32_t total = frames_received_.load();
     if (total > 0) {
@@ -359,9 +367,12 @@ void CameraDisplayNode::logSyncStats() {
 }
 
 // ============================================================
+// ============================================================
 // Camera Frame Completion Callback
 // ============================================================
 void CameraDisplayNode::onRequestCompleted(libcamera::Request * req) {
+    auto callback_start = std::chrono::steady_clock::now();
+
     if (req->status() == libcamera::Request::RequestCancelled) {
         return;
     }
@@ -440,12 +451,15 @@ void CameraDisplayNode::onRequestCompleted(libcamera::Request * req) {
                 uint32_t received = frames_received_.load();
                 double match_rate = (received > 0) ? (100.0 * matched / received) : 0.0;
                 RCLCPP_INFO(this->get_logger(),
-                           "FPS: %.1f | Matched: %u/%u (%.1f%%) | Drops: %u",
+                           "FPS: %.1f | Matched: %u/%u (%.1f%%) | Drops: %u | Callback: %.1f µs | Memcpy: %.1f µs | SlowCB: %u",
                            smoothed_fps_, matched, received, match_rate,
-                           frame_drops_.load());
+                           frame_drops_.load(), callback_time_us_, memcpy_time_us_,
+                           slow_callbacks_.load());
             } else {
-                RCLCPP_INFO(this->get_logger(), "FPS: %.1f (avg: %.1f)",
-                           smoothed_fps_, avg_fps);
+                RCLCPP_INFO(this->get_logger(),
+                           "FPS: %.1f (avg: %.1f) | Callback: %.1f µs | Memcpy: %.1f µs | SlowCB: %u",
+                           smoothed_fps_, avg_fps, callback_time_us_, memcpy_time_us_,
+                           slow_callbacks_.load());
             }
 
             frames_since_log_ = 0;
@@ -457,16 +471,13 @@ void CameraDisplayNode::onRequestCompleted(libcamera::Request * req) {
 
         // Use trigger timestamp if Pico sync enabled, otherwise use current time
         if (enable_pico_sync_) {
-            // Use latest trigger timestamp (Pico frames come at 20Hz, camera at ~20Hz)
-            // They should be approximately synchronized
-            {
-                std::lock_guard<std::mutex> lock(trigger_map_mutex_);
-                if (latest_trigger_time_.nanoseconds() > 0) {
-                    img_msg->header.stamp = latest_trigger_time_;
-                    frames_matched_++;
-                } else {
-                    img_msg->header.stamp = this->now();
-                }
+            // Use frame_id to look up correct trigger timestamp
+            rclcpp::Time frame_time = getFrameTimestamp(frame_id);
+            if (frame_time.nanoseconds() > 0) {
+                img_msg->header.stamp = frame_time;
+                frames_matched_++;
+            } else {
+                img_msg->header.stamp = this->now();
             }
         } else {
             img_msg->header.stamp = this->now();
@@ -481,12 +492,23 @@ void CameraDisplayNode::onRequestCompleted(libcamera::Request * req) {
 
         // Copy frame data to ROS message (compact, no padding)
         const size_t dst_step = static_cast<size_t>(width_) * 3;
-        img_msg->data.resize(dst_step * static_cast<size_t>(height_));
+        const size_t frame_size = dst_step * static_cast<size_t>(height_);
+        img_msg->data.resize(frame_size);
 
         uint8_t * dst = img_msg->data.data();
-        for (size_t r = 0; r < static_cast<size_t>(height_); ++r) {
-            std::memcpy(dst + r * dst_step, src + r * stride_, dst_step);
+
+        // Optimize: if stride matches expected width, use single bulk memcpy
+        auto memcpy_start = std::chrono::steady_clock::now();
+        if (stride_ == dst_step) {
+            std::memcpy(dst, src, frame_size);
+        } else {
+            // Stride doesn't match: copy row by row
+            for (size_t r = 0; r < static_cast<size_t>(height_); ++r) {
+                std::memcpy(dst + r * dst_step, src + r * stride_, dst_step);
+            }
         }
+        auto memcpy_end = std::chrono::steady_clock::now();
+        memcpy_time_us_ = std::chrono::duration<double>(memcpy_end - memcpy_start).count() * 1e6;
 
         image_pub_->publish(std::move(img_msg));
     }
@@ -496,6 +518,18 @@ requeue:
     req->reuse(libcamera::Request::ReuseFlag::ReuseBuffers);
     if (camera_->queueRequest(req) < 0) {
         RCLCPP_ERROR(this->get_logger(), "re-queueRequest failed");
+    }
+
+    // Measure callback execution time
+    auto callback_end = std::chrono::steady_clock::now();
+    callback_time_us_ = std::chrono::duration<double>(callback_end - callback_start).count() * 1e6;
+
+    // Track slow callbacks (>5ms)
+    if (callback_time_us_ > 5000.0) {
+        slow_callbacks_++;
+        RCLCPP_DEBUG(this->get_logger(),
+                    "Slow callback: %.1f µs (memcpy: %.1f µs)",
+                    callback_time_us_, memcpy_time_us_);
     }
 }
 
