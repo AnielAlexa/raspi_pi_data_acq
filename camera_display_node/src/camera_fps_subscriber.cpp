@@ -9,10 +9,12 @@
 #include <deque>
 #include <mutex>
 #include <cmath>
+#include <thread>
+#include <condition_variable>
 
 class CameraFpsSubscriber : public rclcpp::Node {
 public:
-    CameraFpsSubscriber() : Node("camera_fps_subscriber") {
+    CameraFpsSubscriber() : Node("camera_fps_subscriber"), running_(true) {
         // Subscribe to camera image topic
         image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
             "/camera/image_display",
@@ -30,13 +32,26 @@ public:
 
         frame_count_ = 0;
         last_log_time_ = std::chrono::steady_clock::now();
+
+        // Start display thread
+        
+        display_thread_ = std::thread(&CameraFpsSubscriber::displayThread, this);
+    }
+
+    ~CameraFpsSubscriber() {
+        running_ = false;
+        cv_.notify_all();
+        if (display_thread_.joinable()) {
+            display_thread_.join();
+        }
+        cv::destroyAllWindows();
     }
 
 private:
     void imageCallback(const sensor_msgs::msg::Image::SharedPtr msg) {
         auto now = std::chrono::steady_clock::now();
 
-        // Convert ROS image to OpenCV Mat and display it
+        // Convert ROS image to OpenCV Mat (non-blocking)
         try {
             int cv_type = CV_8UC3; // Default to BGR8
             
@@ -48,10 +63,20 @@ private:
                 cv::cvtColor(frame, frame, cv::COLOR_BGR2RGB);
             }
             
-            cv::imshow("Camera Frame", frame);
-            cv::waitKey(1);  // Process GUI events
+            // Resize to smaller preview (e.g., 640x480 or half size)
+            cv::Mat preview;
+            cv::resize(frame, preview, cv::Size(640, 480));
+            
+            // Push frame to display thread (non-blocking)
+            {
+                std::lock_guard<std::mutex> lock(frame_mutex_);
+                latest_frame_ = preview.clone();
+                new_frame_available_ = true;
+            }
+            cv_.notify_one();
+            
         } catch (const std::exception& e) {
-            RCLCPP_ERROR(this->get_logger(), "Error displaying image: %s", e.what());
+            RCLCPP_ERROR(this->get_logger(), "Error processing image: %s", e.what());
         }
 
         // Calculate time since last frame
@@ -101,6 +126,29 @@ private:
         }
     }
 
+    void displayThread() {
+        while (running_) {
+            cv::Mat frame_to_display;
+            
+            {
+                std::unique_lock<std::mutex> lock(frame_mutex_);
+                cv_.wait(lock, [this] { return new_frame_available_ || !running_; });
+                
+                if (!running_) break;
+                
+                if (new_frame_available_) {
+                    frame_to_display = latest_frame_.clone();
+                    new_frame_available_ = false;
+                }
+            }
+            
+            if (!frame_to_display.empty()) {
+                cv::imshow("Camera Frame", frame_to_display);
+                cv::waitKey(1);  // Process GUI events
+            }
+        }
+    }
+
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
     rclcpp::TimerBase::SharedPtr timer_;
 
@@ -108,6 +156,14 @@ private:
     double smoothed_fps_ = 0.0;
     std::deque<std::chrono::steady_clock::time_point> frame_times_;
     std::chrono::steady_clock::time_point last_log_time_;
+
+    // Display thread members
+    std::thread display_thread_;
+    std::mutex frame_mutex_;
+    std::condition_variable cv_;
+    cv::Mat latest_frame_;
+    bool new_frame_available_ = false;
+    bool running_;
 };
 
 int main(int argc, char **argv) {

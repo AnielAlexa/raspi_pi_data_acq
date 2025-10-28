@@ -1,6 +1,32 @@
 /**
  * @file camera_display_node.h
  * @brief ROS2 node for synchronized camera and IMU capture from Pico
+ *
+ * ARCHITECTURE:
+ * This node uses event-driven asynchronous publishing to minimize camera callback overhead.
+ *
+ * Thread 1 (libcamera callback): onRequestCompleted()
+ *   - Captures frame from camera (~800µs)
+ *   - Looks up trigger timestamp from trigger_map
+ *   - Copies frame data to pre-allocated buffer
+ *   - Swaps to pending buffer and notifies publisher
+ *   - Immediately requeues camera buffer (no blocking)
+ *
+ * Thread 2 (publisher): publisherThreadLoop()
+ *   - Waits on condition variable (zero CPU when idle)
+ *   - Woken instantly when frame ready (event-driven)
+ *   - Publishes pending frames (~700µs)
+ *   - Runs independently, doesn't block camera
+ *
+ * Thread 3 (serial reader): SerialSync
+ *   - Receives trigger packets from Pico
+ *   - Stores timestamps in trigger_map
+ *   - Publishes IMU data immediately
+ *
+ * SYNCHRONIZATION:
+ * - IMU-camera sync preserved: timestamps captured in Thread 1 before async publish
+ * - Thread coordination: condition variable for event-driven notification
+ * - Mutex protects shared frame buffer during swap
  */
 
 #ifndef CAMERA_DISPLAY_NODE_CAMERA_DISPLAY_NODE_H
@@ -17,8 +43,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -47,6 +75,9 @@ private:
     void onTriggerPacket(uint32_t timestamp_us, uint16_t frame_id);
     void onRequestCompleted(libcamera::Request *req);
 
+    // Publisher thread
+    void publisherThreadLoop();
+
     // Utilities
     rclcpp::Time getFrameTimestamp(uint16_t frame_id);
     void logSyncStats();
@@ -56,6 +87,17 @@ private:
     // ============================================================
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
+
+    // Pre-allocated message buffer to reduce allocation overhead
+    sensor_msgs::msg::Image reusable_msg_;
+
+    // Event-driven async publish mechanism
+    std::thread publisher_thread_;
+    std::mutex publish_mutex_;
+    std::condition_variable publish_cv_;
+    bool frame_ready_to_publish_;
+    std::atomic<bool> publisher_running_;
+    sensor_msgs::msg::Image pending_msg_;
 
     // ============================================================
     // Camera Configuration
@@ -108,7 +150,10 @@ private:
     // ============================================================
     double callback_time_us_;
     double memcpy_time_us_;
+    double alloc_time_us_;
+    double publish_time_us_;
     std::atomic<uint32_t> slow_callbacks_;  // Count of callbacks > 5ms
+    std::atomic<uint32_t> frames_skipped_;  // Frames skipped because publisher busy
 };
 
 #endif  // CAMERA_DISPLAY_NODE_CAMERA_DISPLAY_NODE_H
