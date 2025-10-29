@@ -38,11 +38,19 @@ struct TriggerPacket {
     uint16_t crc16;         // CRC checksum
 };
 
+struct AltimeterPacket {
+    uint16_t header;        // 0xCC77
+    uint64_t timestamp_us;  // Microseconds when altimeter sampled
+    float altitude_m;       // Altitude in meters (relative to startup)
+    uint16_t crc16;         // CRC checksum
+};
+
 #pragma pack(pop)
 
 // Packet header constants
 constexpr uint16_t IMU_HEADER = 0xAA55;
 constexpr uint16_t TRIGGER_HEADER = 0xBB66;
+constexpr uint16_t ALTIMETER_HEADER = 0xCC77;
 constexpr int SERIAL_BAUDRATE = 230400;
 constexpr size_t TIME_OFFSET_SAMPLES = 100;
 
@@ -50,11 +58,13 @@ class SerialSync {
 public:
     using ImuCallback = std::function<void(uint32_t timestamp_us, float ax, float ay, float az, float gx, float gy, float gz)>;
     using TriggerCallback = std::function<void(uint32_t timestamp_us, uint16_t frame_id)>;
+    using AltimeterCallback = std::function<void(uint32_t timestamp_us, float altitude_m)>;
 
     SerialSync(rclcpp::Node* node,
                const std::string& port,
                ImuCallback imu_cb,
-               TriggerCallback trigger_cb);
+               TriggerCallback trigger_cb,
+               AltimeterCallback altimeter_cb);
     ~SerialSync();
 
     void start();
@@ -68,6 +78,7 @@ private:
     void serial_read_loop();
     void process_imu_packet(const ImuPacket& pkt);
     void process_trigger_packet(const TriggerPacket& pkt);
+    void process_altimeter_packet(const AltimeterPacket& pkt);
     void initialize_time_offset(uint32_t pico_us);
     uint16_t calculate_crc16(const uint8_t* data, size_t len);
     int64_t calculate_median(std::vector<int64_t>& samples);
@@ -81,6 +92,7 @@ private:
 
     ImuCallback imu_callback_;
     TriggerCallback trigger_callback_;
+    AltimeterCallback altimeter_callback_;
 
     std::atomic<bool> time_offset_initialized_;
     int64_t time_offset_ns_;

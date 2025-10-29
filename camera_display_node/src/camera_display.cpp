@@ -24,7 +24,9 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
                                          frames_matched_(0),
                                          frame_drops_(0),
                                          expected_frame_id_(0),
-                                         trigger_map_max_size_(20)
+                                         trigger_map_max_size_(20),
+                                         altitude_baseline_set_(false),
+                                         altitude_baseline_m_(0.0f)
 {
     // Declare parameters
     camera_index_ = this->declare_parameter<int>("camera_index", 0);
@@ -51,6 +53,16 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     );
     imu_qos.reliable();             // don't drop IMU
     imu_qos.durability_volatile();
+
+    rclcpp::QoS range_qos(
+    rclcpp::QoSInitialization(
+        RMW_QOS_POLICY_HISTORY_KEEP_LAST,
+        10 // keep last N altimeter messages
+    )
+    );
+    range_qos.reliable();
+    range_qos.durability_volatile();
+
     // Create publishers
     image_pub_mono_ = this->create_publisher<sensor_msgs::msg::Image>(
         "/camera/image_mono", mono_qos);
@@ -58,6 +70,8 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
         "/camera/image_color", mono_qos);
     imu_pub_ = this->create_publisher<sensor_msgs::msg::Imu>(
         "/imu/data_raw", imu_qos);
+    range_pub_ = this->create_publisher<sensor_msgs::msg::Range>(
+        "/altimeter/range", range_qos);
 
     if (!initCamera()) {
         RCLCPP_ERROR(this->get_logger(), "Failed to initialize camera");
@@ -355,7 +369,7 @@ bool CameraDisplayNode::initCamera() {
 // Pico Synchronization Initialization
 // ============================================================
 void CameraDisplayNode::initPicoSync(const std::string& serial_port) {
-    // Create serial sync with IMU and trigger callbacks
+    // Create serial sync with IMU, trigger, and altimeter callbacks
     serial_sync_ = std::make_unique<camera_display_node::SerialSync>(
         this,
         serial_port,
@@ -364,6 +378,8 @@ void CameraDisplayNode::initPicoSync(const std::string& serial_port) {
                  std::placeholders::_4, std::placeholders::_5, std::placeholders::_6,
                  std::placeholders::_7),
         std::bind(&CameraDisplayNode::onTriggerPacket, this,
+                 std::placeholders::_1, std::placeholders::_2),
+        std::bind(&CameraDisplayNode::onAltimeterPacket, this,
                  std::placeholders::_1, std::placeholders::_2)
     );
 
@@ -412,6 +428,37 @@ void CameraDisplayNode::onImuPacket(uint32_t timestamp_us, float ax, float ay, f
     imu_msg.angular_velocity_covariance[0] = 0.01;
 
     imu_pub_->publish(imu_msg);
+}
+
+// ============================================================
+// Altimeter Packet Callback
+// ============================================================
+void CameraDisplayNode::onAltimeterPacket(uint32_t timestamp_us, float altitude_m) {
+    if (!serial_sync_ || !range_pub_) return;
+
+    // Zero-reset: capture first altitude reading as baseline
+    if (!altitude_baseline_set_.load()) {
+        altitude_baseline_m_ = altitude_m;
+        altitude_baseline_set_.store(true);
+        RCLCPP_INFO(this->get_logger(), "Altimeter baseline set: %.3f m (will be zeroed)", altitude_m);
+    }
+
+    // Apply baseline correction to guarantee 0.000m at ROS startup
+    float relative_altitude_m = altitude_m - altitude_baseline_m_;
+
+    // Create and publish Range message
+    sensor_msgs::msg::Range range_msg;
+    range_msg.header.stamp = serial_sync_->pico_to_ros_time(timestamp_us);
+    range_msg.header.frame_id = "altimeter";
+
+    // BMP388 altimeter specifications
+    range_msg.radiation_type = sensor_msgs::msg::Range::INFRARED;  // Closest type for barometric
+    range_msg.field_of_view = 0.0;  // N/A for barometric sensor
+    range_msg.min_range = -500.0;   // BMP388 can handle -500m to +9000m
+    range_msg.max_range = 9000.0;
+    range_msg.range = relative_altitude_m;   // Relative altitude (zeroed at ROS startup)
+
+    range_pub_->publish(range_msg);
 }
 
 // ============================================================

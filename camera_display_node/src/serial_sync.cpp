@@ -16,13 +16,15 @@ namespace camera_display_node {
 SerialSync::SerialSync(rclcpp::Node* node,
                        const std::string& port,
                        ImuCallback imu_cb,
-                       TriggerCallback trigger_cb)
+                       TriggerCallback trigger_cb,
+                       AltimeterCallback altimeter_cb)
     : node_(node),
       port_(port),
       serial_fd_(-1),
       running_(false),
       imu_callback_(imu_cb),
       trigger_callback_(trigger_cb),
+      altimeter_callback_(altimeter_cb),
       time_offset_initialized_(false),
       time_offset_ns_(0)
 {
@@ -222,6 +224,26 @@ void SerialSync::process_trigger_packet(const TriggerPacket& pkt)
     trigger_callback_(pkt.timestamp_us, pkt.frame_id);
 }
 
+void SerialSync::process_altimeter_packet(const AltimeterPacket& pkt)
+{
+    // Verify CRC
+    uint16_t calc_crc = calculate_crc16((uint8_t*)&pkt, sizeof(AltimeterPacket) - 2);
+    if (calc_crc != pkt.crc16) {
+        return;
+    }
+
+    // Initialize time offset
+    initialize_time_offset(pkt.timestamp_us);
+
+    // Only process if calibrated
+    if (!time_offset_initialized_.load()) {
+        return;
+    }
+
+    // Call altimeter callback with converted timestamp
+    altimeter_callback_(pkt.timestamp_us, pkt.altitude_m);
+}
+
 void SerialSync::serial_read_loop()
 {
     std::vector<uint8_t> buffer;
@@ -230,12 +252,16 @@ void SerialSync::serial_read_loop()
     uint32_t trigger_count = 0;
     auto last_stats = node_->now();
 
+    // Bulk read buffer - read up to 256 bytes at once for efficiency
+    uint8_t read_buf[256];
+
     while (running_.load()) {
-        uint8_t byte;
-        int n = read(serial_fd_, &byte, 1);
+        // Bulk read: read multiple bytes per syscall to reduce overhead
+        int n = read(serial_fd_, read_buf, sizeof(read_buf));
 
         if (n > 0) {
-            buffer.push_back(byte);
+            // Append all received bytes to buffer
+            buffer.insert(buffer.end(), read_buf, read_buf + n);
 
             // Scan for packet headers
             for (size_t i = 0; i + 1 < buffer.size(); i++) {
@@ -266,6 +292,21 @@ void SerialSync::serial_read_loop()
                         process_trigger_packet(pkt);
                         trigger_count++;
                         buffer.erase(buffer.begin(), buffer.begin() + i + sizeof(TriggerPacket));
+                        i = 0;
+                    } else {
+                        buffer.erase(buffer.begin(), buffer.begin() + i + 1);
+                        i = 0;
+                    }
+                }
+                // Altimeter packet
+                else if (header == ALTIMETER_HEADER && i + sizeof(AltimeterPacket) <= buffer.size()) {
+                    AltimeterPacket pkt;
+                    std::memcpy(&pkt, &buffer[i], sizeof(AltimeterPacket));
+
+                    uint16_t calc_crc = calculate_crc16((uint8_t*)&pkt, sizeof(AltimeterPacket) - 2);
+                    if (calc_crc == pkt.crc16) {
+                        process_altimeter_packet(pkt);
+                        buffer.erase(buffer.begin(), buffer.begin() + i + sizeof(AltimeterPacket));
                         i = 0;
                     } else {
                         buffer.erase(buffer.begin(), buffer.begin() + i + 1);

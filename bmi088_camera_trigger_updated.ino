@@ -10,11 +10,11 @@
 #include <Adafruit_BMP3XX.h>
 
 // ---------------------- Pin definitions ----------------------
-constexpr uint8_t PIN_SPI_SCK   = 18;
-constexpr uint8_t PIN_SPI_MOSI  = 19;
-constexpr uint8_t PIN_SPI_MISO  = 16;
-constexpr uint8_t PIN_CS_ACCEL  = 17;
-constexpr uint8_t PIN_CS_GYRO   = 20;
+constexpr uint8_t PIN_SPI_SCK = 18;
+constexpr uint8_t PIN_SPI_MOSI = 19;
+constexpr uint8_t PIN_SPI_MISO = 16;
+constexpr uint8_t PIN_CS_ACCEL = 17;
+constexpr uint8_t PIN_CS_GYRO = 20;
 
 constexpr uint8_t PIN_CAMERA_TRIGGER = 22;
 
@@ -32,7 +32,7 @@ Adafruit_BMP3XX bmp388;
 
 // ---------------------- Packet structs ----------------------
 struct __attribute__((packed)) ImuPacket {
-  uint16_t header;        // 0xAA55
+  uint16_t header;  // 0xAA55
   uint64_t timestamp_us;
   float ax, ay, az;
   float gx, gy, gz;
@@ -40,7 +40,7 @@ struct __attribute__((packed)) ImuPacket {
 };
 
 struct __attribute__((packed)) TriggerPacket {
-  uint16_t header;        // 0xBB66
+  uint16_t header;  // 0xBB66
   uint64_t timestamp_us;
   uint16_t frame_id;
   uint16_t reserved;
@@ -48,34 +48,34 @@ struct __attribute__((packed)) TriggerPacket {
 };
 
 struct __attribute__((packed)) AltimeterPacket {
-  uint16_t header;        // 0xCC77
+  uint16_t header;  // 0xCC77
   uint64_t timestamp_us;
-  float altitude_m;       // relative altitude
+  float altitude_m;  // relative altitude
   uint16_t crc16;
 };
 
 // ---------------------- Buffers / shared state ----------------------
 volatile ImuPacket imu_buffer[2];
 volatile uint8_t imu_write_idx = 0;
-volatile uint8_t imu_read_idx  = 0;
+volatile uint8_t imu_read_idx = 0;
 volatile bool imu_packet_ready = false;
 
 volatile TriggerPacket trigger_buffer[2];
 volatile uint8_t trigger_write_idx = 0;
-volatile uint8_t trigger_read_idx  = 0;
+volatile uint8_t trigger_read_idx = 0;
 volatile bool trigger_packet_ready = false;
 
 volatile AltimeterPacket alt_buffer[2];
 volatile uint8_t alt_write_idx = 0;
-volatile uint8_t alt_read_idx  = 0;
+volatile uint8_t alt_read_idx = 0;
 volatile bool alt_packet_ready = false;
 
 // Queue-based IMU sampling to prevent frame loss
 // Allow up to 8 pending IMU samples (enough to cover altimeter I2C blocking)
 constexpr uint8_t IMU_QUEUE_SIZE = 8;
 volatile uint32_t imu_timestamp_queue[IMU_QUEUE_SIZE];
-volatile uint8_t imu_queue_head = 0;  // Write position (ISR)
-volatile uint8_t imu_queue_tail = 0;  // Read position (loop)
+volatile uint8_t imu_queue_head = 0;       // Write position (ISR)
+volatile uint8_t imu_queue_tail = 0;       // Read position (loop)
 volatile uint8_t imu_samples_dropped = 0;  // Counter for overflow detection
 
 volatile bool camera_trigger_flag = false;
@@ -163,7 +163,7 @@ bool warmup_altitude_baseline() {
       sum_alt += alt_now;
       good++;
     }
-    delay(100); // ~10 Hz samples during warmup
+    delay(100);  // ~10 Hz samples during warmup
   }
 
   if (good == 0) {
@@ -256,15 +256,15 @@ void loop() {
     // Build trigger packet (CRC OUTSIDE critical section to avoid blocking ISR)
     uint8_t next_t = (trigger_write_idx + 1) & 0x01;
     TriggerPacket* tpkt = (TriggerPacket*)&trigger_buffer[next_t];
-    tpkt->header        = 0xBB66;
-    tpkt->timestamp_us  = (uint64_t)trig_ts;
-    tpkt->frame_id      = frame_id_local;
-    tpkt->reserved      = 0;
-    tpkt->crc16         = crc16_ibm((uint8_t*)tpkt, sizeof(TriggerPacket) - 2);  // CRC calc with interrupts ENABLED
+    tpkt->header = 0xBB66;
+    tpkt->timestamp_us = (uint64_t)trig_ts;
+    tpkt->frame_id = frame_id_local;
+    tpkt->reserved = 0;
+    tpkt->crc16 = crc16_ibm((uint8_t*)tpkt, sizeof(TriggerPacket) - 2);  // CRC calc with interrupts ENABLED
 
     // Only update index with interrupts disabled
     noInterrupts();
-    trigger_write_idx   = next_t;
+    trigger_write_idx = next_t;
     trigger_packet_ready = true;
     interrupts();
   }
@@ -281,31 +281,36 @@ void loop() {
   // Process ONE IMU sample per loop iteration to avoid boolean flag race condition
   if (imu_queue_tail != imu_queue_head) {
     // Get timestamp from queue
-    uint32_t imu_ts = imu_timestamp_queue[imu_queue_tail];
+    uint32_t imu_ts;
+    bool have_sample = false;
 
-    // Advance tail (must do this atomically)
+    // Atomically pop one timestamp from the queue
     noInterrupts();
-    imu_queue_tail = (imu_queue_tail + 1) % IMU_QUEUE_SIZE;
+    if (imu_queue_tail != imu_queue_head) {
+      imu_ts = imu_timestamp_queue[imu_queue_tail];
+      imu_queue_tail = (imu_queue_tail + 1) % IMU_QUEUE_SIZE;
+      have_sample = true;
+    }
     interrupts();
 
-    // Read sensor (SPI, ~200-500µs)
-    bmi.readSensor();
+    if (have_sample) {
+      // Read IMU now (SPI)
+      bmi.readSensor();
 
-    // Build packet
-    uint8_t next_i = (imu_write_idx + 1) & 0x01;
-    ImuPacket* ipkt = (ImuPacket*)&imu_buffer[next_i];
-    ipkt->header        = 0xAA55;
-    ipkt->timestamp_us  = (uint64_t)imu_ts;
-    ipkt->ax            = bmi.getAccelX_mss();
-    ipkt->ay            = bmi.getAccelY_mss();
-    ipkt->az            = bmi.getAccelZ_mss();
-    ipkt->gx            = bmi.getGyroX_rads();
-    ipkt->gy            = bmi.getGyroY_rads();
-    ipkt->gz            = bmi.getGyroZ_rads();
-    ipkt->crc16         = crc16_ibm((uint8_t*)ipkt, sizeof(ImuPacket) - 2);
+      // Build and send packet immediately
+      ImuPacket pkt;
+      pkt.header = 0xAA55;
+      pkt.timestamp_us = (uint64_t)imu_ts;
+      pkt.ax = bmi.getAccelX_mss();
+      pkt.ay = bmi.getAccelY_mss();
+      pkt.az = bmi.getAccelZ_mss();
+      pkt.gx = bmi.getGyroX_rads();
+      pkt.gy = bmi.getGyroY_rads();
+      pkt.gz = bmi.getGyroZ_rads();
+      pkt.crc16 = crc16_ibm((uint8_t*)&pkt, sizeof(ImuPacket) - 2);
 
-    // Transmit IMMEDIATELY (don't use ready flag to avoid race condition)
-    Serial1.write((uint8_t*)ipkt, sizeof(ImuPacket));
+      Serial1.write((uint8_t*)&pkt, sizeof(ImuPacket));
+    }
   }
 
   // --- Handle altimeter sample @10 Hz ---
@@ -328,10 +333,10 @@ void loop() {
 
       uint8_t next_a = (alt_write_idx + 1) & 0x01;
       AltimeterPacket* apkt = (AltimeterPacket*)&alt_buffer[next_a];
-      apkt->header        = 0xCC77;
-      apkt->timestamp_us  = (uint64_t)alt_ts;
-      apkt->altitude_m    = rel_alt_m;
-      apkt->crc16         = crc16_ibm((uint8_t*)apkt, sizeof(AltimeterPacket) - 2);
+      apkt->header = 0xCC77;
+      apkt->timestamp_us = (uint64_t)alt_ts;
+      apkt->altitude_m = rel_alt_m;
+      apkt->crc16 = crc16_ibm((uint8_t*)apkt, sizeof(AltimeterPacket) - 2);
 
       noInterrupts();
       alt_write_idx = next_a;

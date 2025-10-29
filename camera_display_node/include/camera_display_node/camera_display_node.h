@@ -35,6 +35,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/range.hpp>
 
 #include <libcamera/libcamera.h>
 #include <libcamera/framebuffer_allocator.h>
@@ -73,6 +74,7 @@ private:
     void onImuPacket(uint32_t timestamp_us, float ax, float ay, float az,
                      float gx, float gy, float gz);
     void onTriggerPacket(uint32_t timestamp_us, uint16_t frame_id);
+    void onAltimeterPacket(uint32_t timestamp_us, float altitude_m);
     void onRequestCompleted(libcamera::Request *req);
 
     // Publisher threads
@@ -89,6 +91,7 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_pub_color_;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_pub_mono_;
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::Range>::SharedPtr range_pub_;
 
     // Pre-allocated message buffers to reduce allocation overhead
     sensor_msgs::msg::Image reusable_msg_color_;
@@ -149,6 +152,10 @@ private:
     std::mutex trigger_map_mutex_;
     std::unordered_map<uint16_t, rclcpp::Time> trigger_map_;  // frame_id → timestamp
     rclcpp::Time latest_trigger_time_;                         // Latest trigger timestamp for sync
+
+    // Altimeter baseline (zero-reset on first sample)
+    std::atomic<bool> altitude_baseline_set_;
+    float altitude_baseline_m_;
 
     // ============================================================
     // Synchronization Statistics
