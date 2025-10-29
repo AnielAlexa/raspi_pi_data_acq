@@ -32,21 +32,30 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     enable_pico_sync_ = this->declare_parameter<bool>("enable_pico_sync", true);
 
 
-    rclcpp::QoS qos(
+    rclcpp::QoS mono_qos(
     rclcpp::QoSInitialization(
         RMW_QOS_POLICY_HISTORY_KEEP_LAST,
-        1 // keep only the newest frame
+        2 // tiny buffer, just in case consumer stutters briefly
     )
-);
-qos.best_effort();
-qos.durability_volatile();
+    );
+    mono_qos.reliable();
+    mono_qos.durability_volatile();
+
+    rclcpp::QoS imu_qos(
+    rclcpp::QoSInitialization(
+        RMW_QOS_POLICY_HISTORY_KEEP_LAST,
+        50 // keep last N IMU messages
+    )
+    );
+    imu_qos.reliable();             // don't drop IMU
+    imu_qos.durability_volatile();
     // Create publishers
     image_pub_mono_ = this->create_publisher<sensor_msgs::msg::Image>(
-        "/camera/image_mono", qos);
+        "/camera/image_mono", mono_qos);
     image_pub_color_ = this->create_publisher<sensor_msgs::msg::Image>(
-        "/camera/image_color", qos);
+        "/camera/image_color", mono_qos);
     imu_pub_ = this->create_publisher<sensor_msgs::msg::Imu>(
-        "/imu/data_raw", rclcpp::SensorDataQoS());
+        "/imu/data_raw", imu_qos);
 
     if (!initCamera()) {
         RCLCPP_ERROR(this->get_logger(), "Failed to initialize camera");
@@ -57,14 +66,31 @@ qos.durability_volatile();
     const size_t frame_size_color = static_cast<size_t>(width_) * static_cast<size_t>(height_) * 3;
     const size_t frame_size_mono = static_cast<size_t>(width_) * static_cast<size_t>(height_);
 
-    reusable_msg_color_.data.reserve(frame_size_color);
-    pending_msg_color_.data.reserve(frame_size_color);
-    frame_ready_to_publish_color_ = false;
+    reusable_msg_mono_.header.frame_id = "camera_link";
+    reusable_msg_mono_.encoding = "mono8";
+    reusable_msg_mono_.is_bigendian = false;
+    reusable_msg_mono_.width = width_;
+    reusable_msg_mono_.height = height_;
+    reusable_msg_mono_.step = width_;
 
-    reusable_msg_mono_.data.reserve(frame_size_mono);
-    pending_msg_mono_.data.reserve(frame_size_mono);
-    pending_bgr_for_mono_.data.reserve(frame_size_color);  // BGR source for conversion
-    frame_ready_to_publish_mono_ = false;
+    // Pre-size, not just reserve
+    reusable_msg_mono_.data.resize(frame_size_mono);
+
+    pending_msg_mono_ = reusable_msg_mono_; // copies metadata + allocates its own buffer
+    // Make sure it also has correct size and capacity
+    pending_msg_mono_.data.resize(frame_size_mono);
+
+    // --- Color buffers ---
+    reusable_msg_color_.header.frame_id = "camera_link";
+    reusable_msg_color_.encoding = "bgr8";
+    reusable_msg_color_.is_bigendian = false;
+    reusable_msg_color_.width = width_;
+    reusable_msg_color_.height = height_;
+    reusable_msg_color_.step = width_ * 3;
+
+    reusable_msg_color_.data.resize(frame_size_color);
+    pending_msg_color_ = reusable_msg_color_;
+    pending_msg_color_.data.resize(frame_size_color);
 
     // Start event-driven publisher threads
     // Mono @ 20 Hz for VIO, Color @ 2 Hz for visualization
@@ -264,6 +290,9 @@ bool CameraDisplayNode::initCamera() {
     libcamera::ControlList controls(camera_->controls());
     controls.set(libcamera::controls::AeEnable, false);
     controls.set(libcamera::controls::AwbEnable, false);
+    controls.set(libcamera::controls::ExposureTime, 3000); // 3000 µs = 3 ms shutter
+// analog gain (sensor gain)
+    controls.set(libcamera::controls::AnalogueGain, 4.0f); 
 
     if (camera_->start(&controls) < 0) {
         RCLCPP_ERROR(this->get_logger(), "camera->start failed");
@@ -602,24 +631,24 @@ void CameraDisplayNode::onRequestCompleted(libcamera::Request * req) {
 
         // === MONO MESSAGE (every frame) ===
         reusable_msg_mono_.header.stamp = frame_timestamp;
-        reusable_msg_mono_.header.frame_id = "camera_link";
-        reusable_msg_mono_.width = width_;
-        reusable_msg_mono_.height = height_;
-        reusable_msg_mono_.encoding = "mono8";
-        reusable_msg_mono_.is_bigendian = false;
-        reusable_msg_mono_.step = width_;
-        reusable_msg_mono_.data.resize(frame_size_mono);
+        // reusable_msg_mono_.header.frame_id = "camera_link";
+        // reusable_msg_mono_.width = width_;
+        // reusable_msg_mono_.height = height_;
+        // reusable_msg_mono_.encoding = "mono8";
+        // reusable_msg_mono_.is_bigendian = false;
+        // reusable_msg_mono_.step = width_;
+        // reusable_msg_mono_.data.resize(frame_size_mono);
 
         // === COLOR MESSAGE (every 10th frame) ===
         if (publish_color_frame) {
             reusable_msg_color_.header.stamp = frame_timestamp;
-            reusable_msg_color_.header.frame_id = "camera_link";
-            reusable_msg_color_.width = width_;
-            reusable_msg_color_.height = height_;
-            reusable_msg_color_.encoding = "bgr8";
-            reusable_msg_color_.is_bigendian = false;
-            reusable_msg_color_.step = width_ * 3;
-            reusable_msg_color_.data.resize(frame_size_color);
+            // reusable_msg_color_.header.frame_id = "camera_link";
+            // reusable_msg_color_.width = width_;
+            // reusable_msg_color_.height = height_;
+            // reusable_msg_color_.encoding = "bgr8";
+            // reusable_msg_color_.is_bigendian = false;
+            // reusable_msg_color_.step = width_ * 3;
+            // reusable_msg_color_.data.resize(frame_size_color);
         }
 
         auto alloc_end = std::chrono::steady_clock::now();
