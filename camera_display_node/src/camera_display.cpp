@@ -8,9 +8,11 @@
 #include <libcamera/formats.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <cerrno>
 
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <rclcpp/executors/multi_threaded_executor.hpp>
 
 // ============================================================
@@ -63,7 +65,8 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     }
 
     // Pre-allocate message buffers to avoid per-frame allocations
-    const size_t frame_size_color = static_cast<size_t>(width_) * static_cast<size_t>(height_) * 3;
+    // NV12: Y plane (width*height) + UV plane (width*height/2) = 1.5x size
+    const size_t frame_size_yuv = static_cast<size_t>(width_) * static_cast<size_t>(height_) * 3 / 2;
     const size_t frame_size_mono = static_cast<size_t>(width_) * static_cast<size_t>(height_);
 
     reusable_msg_mono_.header.frame_id = "camera_link";
@@ -80,17 +83,17 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     // Make sure it also has correct size and capacity
     pending_msg_mono_.data.resize(frame_size_mono);
 
-    // --- Color buffers ---
+    // --- YUV buffers ---
     reusable_msg_color_.header.frame_id = "camera_link";
-    reusable_msg_color_.encoding = "bgr8";
+    reusable_msg_color_.encoding = "yuv420";  // NV12 is compatible with yuv420
     reusable_msg_color_.is_bigendian = false;
     reusable_msg_color_.width = width_;
     reusable_msg_color_.height = height_;
-    reusable_msg_color_.step = width_ * 3;
+    reusable_msg_color_.step = width_;  // Y plane stride
 
-    reusable_msg_color_.data.resize(frame_size_color);
+    reusable_msg_color_.data.resize(frame_size_yuv);
     pending_msg_color_ = reusable_msg_color_;
-    pending_msg_color_.data.resize(frame_size_color);
+    pending_msg_color_.data.resize(frame_size_yuv);
 
     // Start event-driven publisher threads
     // Mono @ 20 Hz for VIO, Color @ 2 Hz for visualization
@@ -214,7 +217,7 @@ bool CameraDisplayNode::initCamera() {
     }
 
     libcamera::StreamConfiguration & stream_cfg = config->at(0);
-    stream_cfg.pixelFormat = libcamera::formats::BGR888;
+    stream_cfg.pixelFormat = libcamera::formats::NV12;
     stream_cfg.size.width  = width_;
     stream_cfg.size.height = height_;
 
@@ -250,15 +253,53 @@ bool CameraDisplayNode::initCamera() {
         libcamera::FrameBuffer * fb = uptr.get();
         MappedBuffer mb;
         mb.planes.resize(fb->planes().size());
+
+        // Track which file descriptors we've already mapped
+        std::map<int, void*> fd_mappings;
+
         for (size_t p = 0; p < fb->planes().size(); ++p) {
             const libcamera::FrameBuffer::Plane & pl = fb->planes()[p];
-            void * addr = mmap(nullptr, pl.length, PROT_READ | PROT_WRITE,
-                              MAP_SHARED, pl.fd.get(), pl.offset);
-            if (addr == MAP_FAILED) {
-                RCLCPP_ERROR(this->get_logger(), "mmap failed on plane %zu", p);
-                return false;
+            int fd = pl.fd.get();
+
+            void * base_addr = nullptr;
+
+            // Check if we've already mapped this FD
+            auto it = fd_mappings.find(fd);
+            if (it != fd_mappings.end()) {
+                // Reuse existing mapping, adjust by offset
+                base_addr = it->second;
+            } else {
+                // First time mapping this FD - map from offset 0 with full length
+                // For contiguous multi-plane formats, calculate total size needed
+                size_t total_length = pl.offset + pl.length;
+
+                // Check if there are more planes sharing this FD
+                for (size_t next_p = p + 1; next_p < fb->planes().size(); ++next_p) {
+                    const libcamera::FrameBuffer::Plane & next_pl = fb->planes()[next_p];
+                    if (next_pl.fd.get() == fd) {
+                        size_t end_offset = next_pl.offset + next_pl.length;
+                        if (end_offset > total_length) {
+                            total_length = end_offset;
+                        }
+                    }
+                }
+
+                base_addr = mmap(nullptr, total_length, PROT_READ,
+                                MAP_SHARED, fd, 0);
+                if (base_addr == MAP_FAILED) {
+                    RCLCPP_ERROR(this->get_logger(),
+                               "mmap failed on plane %zu: errno=%d (%s), fd=%d, total_length=%zu",
+                               p, errno, strerror(errno), fd, total_length);
+                    return false;
+                }
+                fd_mappings[fd] = base_addr;
             }
-            mb.planes[p] = { addr, pl.length };
+
+            // Store pointer to plane data (base + offset)
+            mb.planes[p] = {
+                static_cast<uint8_t*>(base_addr) + pl.offset,
+                pl.length
+            };
         }
         mappings_.emplace(fb, std::move(mb));
     }
@@ -604,9 +645,8 @@ void CameraDisplayNode::onRequestCompleted(libcamera::Request * req) {
         // Mono @ 20 Hz (every frame) + Color @ 2 Hz (every 10th frame)
         // ============================================================
 
-        const size_t dst_step_color = static_cast<size_t>(width_) * 3;
+        const size_t dst_step_yuv = static_cast<size_t>(width_);  // Y plane stride
         const size_t dst_step_mono = static_cast<size_t>(width_);
-        const size_t frame_size_color = dst_step_color * static_cast<size_t>(height_);
         const size_t frame_size_mono = dst_step_mono * static_cast<size_t>(height_);
 
         // Determine timestamp from trigger synchronization
@@ -654,39 +694,49 @@ void CameraDisplayNode::onRequestCompleted(libcamera::Request * req) {
         auto alloc_end = std::chrono::steady_clock::now();
         alloc_time_us_ = std::chrono::duration<double>(alloc_end - alloc_start).count() * 1e6;
 
-        // === COPY BGR DATA (for color, if needed) ===
-        auto memcpy_start = std::chrono::steady_clock::now();
-        if (publish_color_frame) {
-            uint8_t * dst_color = reusable_msg_color_.data.data();
-            if (stride_ == dst_step_color) {
-                std::memcpy(dst_color, src, frame_size_color);
-            } else {
-                for (size_t r = 0; r < static_cast<size_t>(height_); ++r) {
-                    std::memcpy(dst_color + r * dst_step_color, src + r * stride_, dst_step_color);
-                }
-            }
-        }
-        auto memcpy_end = std::chrono::steady_clock::now();
-        memcpy_time_us_ = std::chrono::duration<double>(memcpy_end - memcpy_start).count() * 1e6;
-
-        // === CONVERT BGR → MONO IN CALLBACK (fast fixed-point conversion) ===
+        // === EXTRACT Y-PLANE FOR MONO (every frame @ 20 Hz) ===
+        // NV12 format: plane[0] = Y channel (already mono!)
         auto convert_start = std::chrono::steady_clock::now();
         uint8_t* dst_mono = reusable_msg_mono_.data.data();
 
-        for (size_t r = 0; r < static_cast<size_t>(height_); ++r) {
-            const uint8_t* src_row = src + r * stride_;
-            uint8_t* dst_row = dst_mono + r * static_cast<size_t>(width_);
-
-            for (size_t c = 0; c < static_cast<size_t>(width_); ++c) {
-                const uint8_t b = src_row[c * 3 + 0];
-                const uint8_t g = src_row[c * 3 + 1];
-                const uint8_t r_val = src_row[c * 3 + 2];
-                // Fixed-point: Y = (77*R + 150*G + 29*B) >> 8
-                dst_row[c] = static_cast<uint8_t>((77 * r_val + 150 * g + 29 * b) >> 8);
+        if (stride_ == dst_step_mono) {
+            // Fast path: direct memcpy
+            std::memcpy(dst_mono, src, frame_size_mono);
+        } else {
+            // Stride differs: row-by-row copy
+            for (size_t r = 0; r < static_cast<size_t>(height_); ++r) {
+                std::memcpy(dst_mono + r * dst_step_mono, src + r * stride_, dst_step_mono);
             }
         }
         auto convert_end = std::chrono::steady_clock::now();
         convert_time_us_ = std::chrono::duration<double>(convert_end - convert_start).count() * 1e6;
+
+        // === COPY NV12 DATA (Y + UV planes for YUV, every 10th frame @ 2 Hz) ===
+        auto memcpy_start = std::chrono::steady_clock::now();
+        if (publish_color_frame) {
+            uint8_t * dst_yuv = reusable_msg_color_.data.data();
+
+            // Copy Y plane (plane[0])
+            const uint8_t* y_plane = src;  // Y is in plane[0]
+            size_t y_plane_size = static_cast<size_t>(width_) * static_cast<size_t>(height_);
+
+            if (stride_ == dst_step_yuv) {
+                std::memcpy(dst_yuv, y_plane, y_plane_size);
+            } else {
+                for (size_t r = 0; r < static_cast<size_t>(height_); ++r) {
+                    std::memcpy(dst_yuv + r * dst_step_yuv, y_plane + r * stride_, dst_step_yuv);
+                }
+            }
+
+            // Copy UV plane (plane[1]) - interleaved U and V
+            if (mit->second.planes.size() > 1) {
+                const uint8_t* uv_plane = static_cast<const uint8_t*>(mit->second.planes[1].addr);
+                size_t uv_plane_size = y_plane_size / 2;  // UV is half the size of Y
+                std::memcpy(dst_yuv + y_plane_size, uv_plane, uv_plane_size);
+            }
+        }
+        auto memcpy_end = std::chrono::steady_clock::now();
+        memcpy_time_us_ = std::chrono::duration<double>(memcpy_end - memcpy_start).count() * 1e6;
 
         // === NOTIFY MONO PUBLISHER (every frame) ===
         {

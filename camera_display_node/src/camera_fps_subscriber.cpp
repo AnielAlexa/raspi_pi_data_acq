@@ -17,7 +17,7 @@ public:
     CameraFpsSubscriber() : Node("camera_fps_subscriber"), running_(true) {
         // Subscribe to camera image topic
         image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
-            "/camera/image_mono",
+            "/camera/image_color",
             rclcpp::SensorDataQoS(),
             std::bind(&CameraFpsSubscriber::imageCallback, this, std::placeholders::_1)
         );
@@ -62,6 +62,14 @@ private:
             if (msg->encoding == "bgr8") {
                 cv::cvtColor(frame, frame, cv::COLOR_BGR2RGB);
             }
+
+            if (msg->encoding == "yuv420") {
+        // NV12 to BGR conversion
+            cv::Mat yuv(msg->height * 3/2, msg->width, CV_8UC1, msg->data.data());
+            cv::Mat bgr;
+            cv::cvtColor(yuv, frame, cv::COLOR_YUV2BGR_NV12);
+            // Use bgr...
+        }
             
             // Resize to smaller preview (e.g., 640x480 or half size)
             cv::Mat preview;
