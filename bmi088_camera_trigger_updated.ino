@@ -1,71 +1,100 @@
-// Raspberry Pi Pico + BMI088 → Precise 400Hz using Hardware Timer
-// UPDATED: Added camera trigger timestamp packets for ROS2 synchronization
-// Sends TWO packet types over Serial:
-//   1. IMU packets @ 400Hz (header 0xAA55, 32 bytes)
-//   2. Trigger packets @ 20Hz (header 0xBB66, 12 bytes)
+// Raspberry Pi Pico + BMI088 + BMP388 → Synchronized Sensor Head
+// IMU @400 Hz, Camera Trigger @20 Hz, Altimeter @10 Hz
+// All data streamed over UART Serial1
+// Altitude = 0.000 m at first live altimeter sample after startup
 
 #include <Arduino.h>
 #include <SPI.h>
+#include <Wire.h>
 #include <BMI088.h>
+#include <Adafruit_BMP3XX.h>
 
-// --- Pin Definitions ---
-constexpr uint8_t PIN_SPI_SCK = 18;
-constexpr uint8_t PIN_SPI_MOSI = 19;
-constexpr uint8_t PIN_SPI_MISO = 16;
-constexpr uint8_t PIN_CS_ACCEL = 17;
-constexpr uint8_t PIN_CS_GYRO = 20;
-constexpr uint8_t PIN_CAMERA_TRIGGER = 22;  // Camera trigger output
+// ---------------------- Pin definitions ----------------------
+constexpr uint8_t PIN_SPI_SCK   = 18;
+constexpr uint8_t PIN_SPI_MOSI  = 19;
+constexpr uint8_t PIN_SPI_MISO  = 16;
+constexpr uint8_t PIN_CS_ACCEL  = 17;
+constexpr uint8_t PIN_CS_GYRO   = 20;
 
-// Camera trigger settings
-constexpr uint32_t CAMERA_TRIGGER_PULSE_US = 100;  // Pulse width in microseconds
+constexpr uint8_t PIN_CAMERA_TRIGGER = 22;
 
-// BMI088 object
+constexpr uint8_t PIN_I2C_SDA = 4;
+constexpr uint8_t PIN_I2C_SCL = 5;
+
+constexpr uint32_t CAMERA_TRIGGER_PULSE_US = 100;
+constexpr uint32_t UART_BAUD = 230400;
+
+constexpr float SEALEVEL_HPA = 1013.25f;
+
+// ---------------------- Sensor objects ----------------------
 Bmi088 bmi(SPI, PIN_CS_ACCEL, PIN_CS_GYRO);
+Adafruit_BMP3XX bmp388;
 
-// IMU Packet structure (32 bytes)
+// ---------------------- Packet structs ----------------------
 struct __attribute__((packed)) ImuPacket {
   uint16_t header;        // 0xAA55
-  uint64_t timestamp_us;  // Microseconds
-  float ax, ay, az;       // m/s²
-  float gx, gy, gz;       // rad/s
-  uint16_t crc16;         // CRC checksum
+  uint64_t timestamp_us;
+  float ax, ay, az;
+  float gx, gy, gz;
+  uint16_t crc16;
 };
 
-// NEW: Camera Trigger Packet structure (12 bytes)
 struct __attribute__((packed)) TriggerPacket {
-  uint16_t header;        // 0xBB66 (different from IMU)
-  uint64_t timestamp_us;  // Microseconds when trigger fired
-  uint16_t frame_id;      // Frame counter
-  uint16_t reserved;      // Reserved for alignment
-  uint16_t crc16;         // CRC checksum
+  uint16_t header;        // 0xBB66
+  uint64_t timestamp_us;
+  uint16_t frame_id;
+  uint16_t reserved;
+  uint16_t crc16;
 };
 
-// Double buffering for IMU
+struct __attribute__((packed)) AltimeterPacket {
+  uint16_t header;        // 0xCC77
+  uint64_t timestamp_us;
+  float altitude_m;       // relative altitude
+  uint16_t crc16;
+};
+
+// ---------------------- Buffers / shared state ----------------------
 volatile ImuPacket imu_buffer[2];
 volatile uint8_t imu_write_idx = 0;
-volatile uint8_t imu_read_idx = 0;
+volatile uint8_t imu_read_idx  = 0;
+volatile bool imu_packet_ready = false;
 
-// NEW: Double buffering for triggers
 volatile TriggerPacket trigger_buffer[2];
 volatile uint8_t trigger_write_idx = 0;
-volatile uint8_t trigger_read_idx = 0;
+volatile uint8_t trigger_read_idx  = 0;
+volatile bool trigger_packet_ready = false;
 
-// Flags for synchronization
-volatile bool sample_ready = false;        // Timer says: time to read IMU
-volatile bool imu_packet_ready = false;    // IMU packet filled and ready to send
-volatile bool trigger_packet_ready = false; // NEW: Trigger packet ready to send
-volatile uint32_t sample_timestamp = 0;    // Timestamp captured in ISR
-volatile uint32_t trigger_timestamp = 0;   // NEW: Trigger timestamp captured in ISR
-volatile bool camera_trigger_flag = false; // Camera trigger flag
+volatile AltimeterPacket alt_buffer[2];
+volatile uint8_t alt_write_idx = 0;
+volatile uint8_t alt_read_idx  = 0;
+volatile bool alt_packet_ready = false;
 
-// Statistics
-volatile uint32_t timer_ticks = 0;
-volatile uint32_t missed_samples = 0;
-volatile uint32_t camera_triggers = 0;
-volatile uint16_t frame_counter = 0;  // NEW: Global frame counter
+// Queue-based IMU sampling to prevent frame loss
+// Allow up to 8 pending IMU samples (enough to cover altimeter I2C blocking)
+constexpr uint8_t IMU_QUEUE_SIZE = 8;
+volatile uint32_t imu_timestamp_queue[IMU_QUEUE_SIZE];
+volatile uint8_t imu_queue_head = 0;  // Write position (ISR)
+volatile uint8_t imu_queue_tail = 0;  // Read position (loop)
+volatile uint8_t imu_samples_dropped = 0;  // Counter for overflow detection
 
-// --- CRC16 Calculation ---
-uint16_t crc16(const uint8_t* data, size_t len) {
+volatile bool camera_trigger_flag = false;
+volatile bool altimeter_sample_flag = false;
+
+volatile uint32_t trigger_timestamp = 0;
+volatile uint32_t altimeter_timestamp = 0;
+
+volatile uint16_t frame_counter = 0;
+
+// altitude baseline state
+float altitude_baseline_m = 0.0f;
+// baseline_ready = we have at least some idea (after setup())
+bool baseline_ready = false;
+// baseline_finalized = we locked the "true zero" in loop()
+bool baseline_finalized = false;
+
+// ---------------------- CRC16 ----------------------
+uint16_t crc16_ibm(const uint8_t* data, size_t len) {
   uint16_t crc = 0xFFFF;
   for (size_t i = 0; i < len; i++) {
     crc ^= data[i];
@@ -80,227 +109,259 @@ uint16_t crc16(const uint8_t* data, size_t len) {
   return crc;
 }
 
-// --- Timer Callback (FAST - just sets flags!) ---
-bool timer_callback(struct repeating_timer *t) {
-  // Check if previous sample was processed
-  if (sample_ready) {
-    missed_samples++;  // Main loop didn't read fast enough
+// ---------------------- Timer ISR @400Hz ----------------------
+bool timer_callback(struct repeating_timer* /*t*/) {
+  uint32_t now_us = micros();
+
+  // 400 Hz IMU sampling - queue-based to prevent frame loss
+  uint8_t next_head = (imu_queue_head + 1) % IMU_QUEUE_SIZE;
+  if (next_head != imu_queue_tail) {
+    // Queue has space - add timestamp
+    imu_timestamp_queue[imu_queue_head] = now_us;
+    imu_queue_head = next_head;
+  } else {
+    // Queue full - count dropped sample (should never happen with size 8)
+    imu_samples_dropped++;
   }
 
-  // Capture timestamp and signal main loop
-  sample_timestamp = micros();
-  sample_ready = true;
-  timer_ticks++;
-
-  // Camera trigger logic (400Hz / 20 = 20Hz)
+  // 20 Hz camera trigger
   static uint8_t camera_divider = 0;
   camera_divider++;
   if (camera_divider >= 20) {
     camera_divider = 0;
     camera_trigger_flag = true;
-    camera_triggers++;
-    trigger_timestamp = sample_timestamp;  // NEW: Capture trigger timestamp
-    frame_counter++;  // NEW: Increment frame counter
-
-    // Generate trigger pulse (HIGH)
+    trigger_timestamp = now_us;
+    frame_counter++;
     digitalWrite(PIN_CAMERA_TRIGGER, HIGH);
   }
 
-  return true;  // Continue timer
+  // 10 Hz altimeter
+  static uint8_t alt_divider = 0;
+  alt_divider++;
+  if (alt_divider >= 40) {
+    alt_divider = 0;
+    altimeter_sample_flag = true;
+    altimeter_timestamp = now_us;
+  }
+
+  return true;
 }
 
-// --- Setup ---
+// ---------------------- Baseline calibration (warm-up) ----------------------
+// We average a few readings in setup() just to get something reasonable.
+// This does NOT lock the final zero. Final zero happens in loop() on first
+// live altimeter sample.
+bool warmup_altitude_baseline() {
+  const uint8_t N = 10;
+  float sum_alt = 0.0f;
+  uint8_t good = 0;
+
+  uint32_t start_ms = millis();
+  while (good < N && (millis() - start_ms) < 5000) {
+    if (bmp388.performReading()) {
+      float alt_now = bmp388.readAltitude(SEALEVEL_HPA);
+      sum_alt += alt_now;
+      good++;
+    }
+    delay(100); // ~10 Hz samples during warmup
+  }
+
+  if (good == 0) {
+    return false;
+  }
+
+  altitude_baseline_m = sum_alt / (float)good;
+  baseline_ready = true;
+  baseline_finalized = false;
+  return true;
+}
+
+// ---------------------- setup() ----------------------
 void setup() {
-  Serial.begin(921600);
+  Serial1.begin(UART_BAUD);
 
-  // LED for status
   pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
 
-  // Camera trigger pin
   pinMode(PIN_CAMERA_TRIGGER, OUTPUT);
   digitalWrite(PIN_CAMERA_TRIGGER, LOW);
 
-  // Configure SPI pins
   pinMode(PIN_CS_ACCEL, OUTPUT);
   pinMode(PIN_CS_GYRO, OUTPUT);
   digitalWrite(PIN_CS_ACCEL, HIGH);
   digitalWrite(PIN_CS_GYRO, HIGH);
 
-  // Initialize SPI
   SPI.setRX(PIN_SPI_MISO);
   SPI.setTX(PIN_SPI_MOSI);
   SPI.setSCK(PIN_SPI_SCK);
   SPI.begin();
 
-  // Wait briefly for serial
-  uint32_t t0 = millis();
-  while (!Serial && (millis() - t0) < 2000) {}
+  Wire.setSDA(PIN_I2C_SDA);
+  Wire.setSCL(PIN_I2C_SCL);
+  Wire.setClock(400000);
+  Wire.begin();
 
-  // Initialize BMI088
-  int status = bmi.begin();
-  if (status <= 0) {
-    // Error: fast blink forever
-    Serial.println("ERROR: BMI088 init failed!");
-    while(1) {
+  if (bmi.begin() <= 0) {
+    while (1) {
       digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
       delay(100);
     }
   }
 
-  // Configure sensor: 400Hz, ±6g, ±500dps
   bmi.setOdr(Bmi088::ODR_400HZ);
   bmi.setRange(Bmi088::ACCEL_RANGE_6G, Bmi088::GYRO_RANGE_500DPS);
-
-  // Small delay for sensor to stabilize
   delay(100);
 
-  // Setup hardware timer for EXACT 400Hz (2500µs period)
-  static struct repeating_timer timer;
-  bool timer_ok = add_repeating_timer_us(
-    -2500,  // Negative = measure from end of last callback
-    timer_callback,
-    NULL,
-    &timer
-  );
-
-  if (!timer_ok) {
-    Serial.println("ERROR: Timer setup failed!");
-    while(1) {
+  if (!bmp388.begin_I2C()) {
+    while (1) {
       digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-      delay(50);
+      delay(100);
     }
   }
 
-  // Ready
+  // Reduced oversampling to minimize I2C blocking time
+  // This prevents IMU frame loss during altimeter reads
+  bmp388.setTemperatureOversampling(BMP3_OVERSAMPLING_2X);  // Was 8X
+  bmp388.setPressureOversampling(BMP3_OVERSAMPLING_8X);     // Was 32X (4× faster!)
+  bmp388.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
+  bmp388.setOutputDataRate(BMP3_ODR_12_5_HZ);  // Was 50 Hz, now 12.5 Hz (slightly above our 10 Hz read rate)
+
+  if (!warmup_altitude_baseline()) {
+    while (1) {
+      digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+      delay(100);
+    }
+  }
+
+  static struct repeating_timer timer;
+  add_repeating_timer_us(-2500, timer_callback, NULL, &timer);
+
   digitalWrite(LED_BUILTIN, HIGH);
-  Serial.println("# BMI088 + Camera Trigger Ready - 400Hz IMU + 20Hz Trigger Packets");
 }
 
-// --- Main Loop (handles SPI and packet sending) ---
+// ---------------------- loop() ----------------------
 void loop() {
-  static uint32_t last_stats = 0;
-  static uint32_t imu_packets_sent = 0;
-  static uint32_t trigger_packets_sent = 0;
-  static uint32_t camera_pulse_start = 0;
+  static uint32_t camera_pulse_start_us = 0;
 
-  // Handle camera trigger pulse (end the pulse after specified duration)
+  // --- Handle camera trigger pulse ---
   if (camera_trigger_flag) {
-    camera_pulse_start = micros();
-
-    // NEW: Create trigger packet immediately when trigger fires
     noInterrupts();
-    uint8_t next_write = (trigger_write_idx + 1) % 2;
-    TriggerPacket* tpkt = (TriggerPacket*)&trigger_buffer[next_write];
-
-    tpkt->header = 0xBB66;  // Different header for trigger packets
-    tpkt->timestamp_us = trigger_timestamp;
-    tpkt->frame_id = frame_counter;
-    tpkt->reserved = 0;
-    tpkt->crc16 = crc16((uint8_t*)tpkt, sizeof(TriggerPacket) - 2);
-
-    trigger_write_idx = next_write;
-    trigger_packet_ready = true;
     camera_trigger_flag = false;
+    uint32_t trig_ts = trigger_timestamp;
+    uint16_t frame_id_local = frame_counter;
     interrupts();
-  }
 
-  // End camera pulse after pulse width
-  if (camera_pulse_start > 0 && (micros() - camera_pulse_start) >= CAMERA_TRIGGER_PULSE_US) {
-    digitalWrite(PIN_CAMERA_TRIGGER, LOW);
-    camera_pulse_start = 0;
-  }
+    camera_pulse_start_us = micros();
 
-  // Check if timer says it's time to sample IMU
-  if (sample_ready) {
-    // Clear flag immediately
+    // Build trigger packet (CRC OUTSIDE critical section to avoid blocking ISR)
+    uint8_t next_t = (trigger_write_idx + 1) & 0x01;
+    TriggerPacket* tpkt = (TriggerPacket*)&trigger_buffer[next_t];
+    tpkt->header        = 0xBB66;
+    tpkt->timestamp_us  = (uint64_t)trig_ts;
+    tpkt->frame_id      = frame_id_local;
+    tpkt->reserved      = 0;
+    tpkt->crc16         = crc16_ibm((uint8_t*)tpkt, sizeof(TriggerPacket) - 2);  // CRC calc with interrupts ENABLED
+
+    // Only update index with interrupts disabled
     noInterrupts();
-    bool ready = sample_ready;
-    sample_ready = false;
-    uint32_t timestamp = sample_timestamp;
+    trigger_write_idx   = next_t;
+    trigger_packet_ready = true;
+    interrupts();
+  }
+
+  if (camera_pulse_start_us != 0) {
+    uint32_t dt = micros() - camera_pulse_start_us;
+    if (dt >= CAMERA_TRIGGER_PULSE_US) {
+      digitalWrite(PIN_CAMERA_TRIGGER, LOW);
+      camera_pulse_start_us = 0;
+    }
+  }
+
+  // --- Handle IMU samples @400 Hz (queue-based, no frame loss) ---
+  // Process ONE IMU sample per loop iteration to avoid boolean flag race condition
+  if (imu_queue_tail != imu_queue_head) {
+    // Get timestamp from queue
+    uint32_t imu_ts = imu_timestamp_queue[imu_queue_tail];
+
+    // Advance tail (must do this atomically)
+    noInterrupts();
+    imu_queue_tail = (imu_queue_tail + 1) % IMU_QUEUE_SIZE;
     interrupts();
 
-    if (ready) {
-      // Read sensor (SPI transaction - safe in main loop!)
-      bmi.readSensor();
+    // Read sensor (SPI, ~200-500µs)
+    bmi.readSensor();
 
-      // Get next write buffer
-      uint8_t next_write = (imu_write_idx + 1) % 2;
+    // Build packet
+    uint8_t next_i = (imu_write_idx + 1) & 0x01;
+    ImuPacket* ipkt = (ImuPacket*)&imu_buffer[next_i];
+    ipkt->header        = 0xAA55;
+    ipkt->timestamp_us  = (uint64_t)imu_ts;
+    ipkt->ax            = bmi.getAccelX_mss();
+    ipkt->ay            = bmi.getAccelY_mss();
+    ipkt->az            = bmi.getAccelZ_mss();
+    ipkt->gx            = bmi.getGyroX_rads();
+    ipkt->gy            = bmi.getGyroY_rads();
+    ipkt->gz            = bmi.getGyroZ_rads();
+    ipkt->crc16         = crc16_ibm((uint8_t*)ipkt, sizeof(ImuPacket) - 2);
 
-      // Fill IMU packet
-      ImuPacket* pkt = (ImuPacket*)&imu_buffer[next_write];
-      pkt->header = 0xAA55;
-      pkt->timestamp_us = timestamp;
-      pkt->ax = bmi.getAccelX_mss();
-      pkt->ay = bmi.getAccelY_mss();
-      pkt->az = bmi.getAccelZ_mss();
-      pkt->gx = bmi.getGyroX_rads();
-      pkt->gy = bmi.getGyroY_rads();
-      pkt->gz = bmi.getGyroZ_rads();
-      pkt->crc16 = crc16((uint8_t*)pkt, sizeof(ImuPacket) - 2);
+    // Transmit IMMEDIATELY (don't use ready flag to avoid race condition)
+    Serial1.write((uint8_t*)ipkt, sizeof(ImuPacket));
+  }
 
-      // Atomically swap buffers and signal packet ready
+  // --- Handle altimeter sample @10 Hz ---
+  if (altimeter_sample_flag && baseline_ready) {
+    noInterrupts();
+    altimeter_sample_flag = false;
+    uint32_t alt_ts = altimeter_timestamp;
+    interrupts();
+
+    if (bmp388.performReading()) {
+      float raw_alt_m = bmp388.readAltitude(SEALEVEL_HPA);
+
+      // Finalize baseline on FIRST live reading in loop()
+      if (!baseline_finalized) {
+        altitude_baseline_m = raw_alt_m;
+        baseline_finalized = true;
+      }
+
+      float rel_alt_m = raw_alt_m - altitude_baseline_m;
+
+      uint8_t next_a = (alt_write_idx + 1) & 0x01;
+      AltimeterPacket* apkt = (AltimeterPacket*)&alt_buffer[next_a];
+      apkt->header        = 0xCC77;
+      apkt->timestamp_us  = (uint64_t)alt_ts;
+      apkt->altitude_m    = rel_alt_m;
+      apkt->crc16         = crc16_ibm((uint8_t*)apkt, sizeof(AltimeterPacket) - 2);
+
       noInterrupts();
-      imu_write_idx = next_write;
-      imu_packet_ready = true;
+      alt_write_idx = next_a;
+      alt_packet_ready = true;
       interrupts();
     }
   }
 
-  // Send IMU packet if ready
-  if (imu_packet_ready) {
-    // Atomically get buffer to send
-    noInterrupts();
-    uint8_t idx = imu_read_idx;
-    imu_read_idx = imu_write_idx;
-    imu_packet_ready = false;
-    interrupts();
+  // --- UART transmit packets ---
+  // (IMU is transmitted immediately above to avoid race condition)
 
-    // Send IMU packet
-    Serial.write((uint8_t*)&imu_buffer[idx], sizeof(ImuPacket));
-    imu_packets_sent++;
-  }
-
-  // NEW: Send trigger packet if ready
   if (trigger_packet_ready) {
-    // Atomically get buffer to send
     noInterrupts();
     uint8_t idx = trigger_read_idx;
     trigger_read_idx = trigger_write_idx;
     trigger_packet_ready = false;
     interrupts();
 
-    // Send trigger packet
-    Serial.write((uint8_t*)&trigger_buffer[idx], sizeof(TriggerPacket));
-    trigger_packets_sent++;
+    Serial1.write((uint8_t*)&trigger_buffer[idx], sizeof(TriggerPacket));
   }
 
-  // Periodic status (every 1 second)
-  uint32_t now = millis();
-  if (now - last_stats >= 1000) {
-    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+  if (alt_packet_ready) {
+    noInterrupts();
+    uint8_t idx = alt_read_idx;
+    alt_read_idx = alt_write_idx;
+    alt_packet_ready = false;
+    interrupts();
 
-    // Debug stats (comment out for production)
-    // Uncomment these lines to see statistics on Serial Monitor:
-    /*
-    Serial.print("# Timer: ");
-    Serial.print(timer_ticks);
-    Serial.print(" Hz, IMU: ");
-    Serial.print(imu_packets_sent);
-    Serial.print(", Trigger: ");
-    Serial.print(trigger_packets_sent);
-    Serial.print(" Hz, Frames: ");
-    Serial.print(frame_counter);
-    Serial.print(", Missed: ");
-    Serial.println(missed_samples);
-    */
-
-    imu_packets_sent = 0;
-    trigger_packets_sent = 0;
-    timer_ticks = 0;
-    camera_triggers = 0;
-    missed_samples = 0;
-    last_stats = now;
+    Serial1.write((uint8_t*)&alt_buffer[idx], sizeof(AltimeterPacket));
   }
 
-  // No delays - loop as fast as possible
+  // no delay()
 }
