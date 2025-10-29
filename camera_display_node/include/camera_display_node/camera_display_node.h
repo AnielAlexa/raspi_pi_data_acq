@@ -75,8 +75,9 @@ private:
     void onTriggerPacket(uint32_t timestamp_us, uint16_t frame_id);
     void onRequestCompleted(libcamera::Request *req);
 
-    // Publisher thread
-    void publisherThreadLoop();
+    // Publisher threads
+    void publisherThreadLoopColor();
+    void publisherThreadLoopMono();
 
     // Utilities
     rclcpp::Time getFrameTimestamp(uint16_t frame_id);
@@ -85,19 +86,30 @@ private:
     // ============================================================
     // Publishers
     // ============================================================
-    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_pub_color_;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_pub_mono_;
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
 
-    // Pre-allocated message buffer to reduce allocation overhead
-    sensor_msgs::msg::Image reusable_msg_;
+    // Pre-allocated message buffers to reduce allocation overhead
+    sensor_msgs::msg::Image reusable_msg_color_;
+    sensor_msgs::msg::Image reusable_msg_mono_;
 
-    // Event-driven async publish mechanism
-    std::thread publisher_thread_;
-    std::mutex publish_mutex_;
-    std::condition_variable publish_cv_;
-    bool frame_ready_to_publish_;
-    std::atomic<bool> publisher_running_;
-    sensor_msgs::msg::Image pending_msg_;
+    // Event-driven async publish mechanism - Color publisher (2 Hz)
+    std::thread publisher_thread_color_;
+    std::mutex publish_mutex_color_;
+    std::condition_variable publish_cv_color_;
+    bool frame_ready_to_publish_color_;
+    std::atomic<bool> publisher_running_color_;
+    sensor_msgs::msg::Image pending_msg_color_;
+
+    // Event-driven async publish mechanism - Mono publisher (20 Hz)
+    std::thread publisher_thread_mono_;
+    std::mutex publish_mutex_mono_;
+    std::condition_variable publish_cv_mono_;
+    bool frame_ready_to_publish_mono_;
+    std::atomic<bool> publisher_running_mono_;
+    sensor_msgs::msg::Image pending_msg_mono_;
+    sensor_msgs::msg::Image pending_bgr_for_mono_;  // BGR frame to convert
 
     // ============================================================
     // Camera Configuration
@@ -150,10 +162,14 @@ private:
     // ============================================================
     double callback_time_us_;
     double memcpy_time_us_;
+    double convert_time_us_;
     double alloc_time_us_;
-    double publish_time_us_;
+    double publish_time_mono_us_;
+    double publish_time_color_us_;
     std::atomic<uint32_t> slow_callbacks_;  // Count of callbacks > 5ms
-    std::atomic<uint32_t> frames_skipped_;  // Frames skipped because publisher busy
+    std::atomic<uint32_t> frames_skipped_mono_;
+    std::atomic<uint32_t> frames_skipped_color_;
+    std::atomic<uint32_t> frame_counter_;  // For color decimation (every 10th frame)
 };
 
 #endif  // CAMERA_DISPLAY_NODE_CAMERA_DISPLAY_NODE_H

@@ -41,8 +41,10 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
 qos.best_effort();
 qos.durability_volatile();
     // Create publishers
-    image_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
-        "/camera/image_display", qos);
+    image_pub_mono_ = this->create_publisher<sensor_msgs::msg::Image>(
+        "/camera/image_mono", qos);
+    image_pub_color_ = this->create_publisher<sensor_msgs::msg::Image>(
+        "/camera/image_color", qos);
     imu_pub_ = this->create_publisher<sensor_msgs::msg::Imu>(
         "/imu/data_raw", rclcpp::SensorDataQoS());
 
@@ -52,18 +54,26 @@ qos.durability_volatile();
     }
 
     // Pre-allocate message buffers to avoid per-frame allocations
-    const size_t frame_size = static_cast<size_t>(width_) * static_cast<size_t>(height_) * 3;
-    reusable_msg_.data.reserve(frame_size);
-    pending_msg_.data.reserve(frame_size);
-    frame_ready_to_publish_ = false;
+    const size_t frame_size_color = static_cast<size_t>(width_) * static_cast<size_t>(height_) * 3;
+    const size_t frame_size_mono = static_cast<size_t>(width_) * static_cast<size_t>(height_);
 
-    // Start event-driven publisher thread
-    // Uses condition variable for instant notification (zero CPU when idle)
-    // This removes ~700µs of publish overhead from the camera callback thread
-    publisher_running_ = true;
-    publisher_thread_ = std::thread(&CameraDisplayNode::publisherThreadLoop, this);
+    reusable_msg_color_.data.reserve(frame_size_color);
+    pending_msg_color_.data.reserve(frame_size_color);
+    frame_ready_to_publish_color_ = false;
 
-    RCLCPP_INFO(this->get_logger(), "Camera ready: %dx%d | Event-driven async publish enabled",
+    reusable_msg_mono_.data.reserve(frame_size_mono);
+    pending_msg_mono_.data.reserve(frame_size_mono);
+    pending_bgr_for_mono_.data.reserve(frame_size_color);  // BGR source for conversion
+    frame_ready_to_publish_mono_ = false;
+
+    // Start event-driven publisher threads
+    // Mono @ 20 Hz for VIO, Color @ 2 Hz for visualization
+    publisher_running_mono_ = true;
+    publisher_running_color_ = true;
+    publisher_thread_mono_ = std::thread(&CameraDisplayNode::publisherThreadLoopMono, this);
+    publisher_thread_color_ = std::thread(&CameraDisplayNode::publisherThreadLoopColor, this);
+
+    RCLCPP_INFO(this->get_logger(), "Camera ready: %dx%d | Mono@20Hz + Color@2Hz (event-driven)",
                width_, height_);
 
     // Initialize FPS tracking
@@ -75,10 +85,14 @@ qos.durability_volatile();
     // Initialize performance metrics
     callback_time_us_ = 0.0;
     memcpy_time_us_ = 0.0;
+    convert_time_us_ = 0.0;
     alloc_time_us_ = 0.0;
-    publish_time_us_ = 0.0;
+    publish_time_mono_us_ = 0.0;
+    publish_time_color_us_ = 0.0;
     slow_callbacks_ = 0;
-    frames_skipped_ = 0;
+    frames_skipped_mono_ = 0;
+    frames_skipped_color_ = 0;
+    frame_counter_ = 0;
 
     // Initialize Pico serial synchronization if enabled
     if (enable_pico_sync_) {
@@ -90,12 +104,20 @@ qos.durability_volatile();
 // Destructor
 // ============================================================
 CameraDisplayNode::~CameraDisplayNode() {
-    // Stop publisher thread
-    if (publisher_running_) {
-        publisher_running_ = false;
-        publish_cv_.notify_one();  // Wake up thread so it can exit
-        if (publisher_thread_.joinable()) {
-            publisher_thread_.join();
+    // Stop publisher threads
+    if (publisher_running_mono_) {
+        publisher_running_mono_ = false;
+        publish_cv_mono_.notify_one();
+        if (publisher_thread_mono_.joinable()) {
+            publisher_thread_mono_.join();
+        }
+    }
+
+    if (publisher_running_color_) {
+        publisher_running_color_ = false;
+        publish_cv_color_.notify_one();
+        if (publisher_thread_color_.joinable()) {
+            publisher_thread_color_.join();
         }
     }
 
@@ -378,60 +400,84 @@ void CameraDisplayNode::logSyncStats() {
     RCLCPP_INFO(this->get_logger(), "Total frames received: %u", frames_received_.load());
     RCLCPP_INFO(this->get_logger(), "Frames matched to trigger: %u", frames_matched_.load());
     RCLCPP_INFO(this->get_logger(), "Frame drops detected: %u", frame_drops_.load());
-    RCLCPP_INFO(this->get_logger(), "Frames skipped (publisher busy): %u", frames_skipped_.load());
+    RCLCPP_INFO(this->get_logger(), "Frames skipped - Mono: %u, Color: %u",
+               frames_skipped_mono_.load(), frames_skipped_color_.load());
     RCLCPP_INFO(this->get_logger(), "Slow callbacks (>5ms): %u", slow_callbacks_.load());
-    RCLCPP_INFO(this->get_logger(), "Publishing mode: Event-driven (condition variable, zero CPU idle)");
-    RCLCPP_INFO(this->get_logger(), "Last callback: %.1f µs [alloc: %.1f, memcpy: %.1f]",
-               callback_time_us_, alloc_time_us_, memcpy_time_us_);
-    RCLCPP_INFO(this->get_logger(), "Last publish: %.1f µs (separate thread, instant notification)", publish_time_us_);
+    RCLCPP_INFO(this->get_logger(), "Publishing mode: Dual stream (Mono@20Hz + Color@2Hz, event-driven)");
+    RCLCPP_INFO(this->get_logger(), "Last callback: %.1f µs [alloc: %.1f, convert: %.1f, memcpy: %.1f]",
+               callback_time_us_, alloc_time_us_, convert_time_us_, memcpy_time_us_);
+    RCLCPP_INFO(this->get_logger(), "Last publish: Mono %.1f µs, Color %.1f µs",
+               publish_time_mono_us_, publish_time_color_us_);
 
     uint32_t total = frames_received_.load();
-    uint32_t published = total - frames_skipped_.load();
+    uint32_t published_mono = total - frames_skipped_mono_.load();
+    uint32_t published_color = (total / 10) - frames_skipped_color_.load();
     if (total > 0) {
         double match_rate = (100.0 * frames_matched_.load()) / total;
-        double publish_rate = (100.0 * published) / total;
+        double mono_rate = (100.0 * published_mono) / total;
+        double color_rate = (100.0 * published_color * 10) / total;  // Normalize to 100%
         RCLCPP_INFO(this->get_logger(), "Match rate: %.1f%%", match_rate);
-        RCLCPP_INFO(this->get_logger(), "Publish rate: %.1f%% (%u/%u frames)",
-                   publish_rate, published, total);
+        RCLCPP_INFO(this->get_logger(), "Mono publish rate: %.1f%% (%u/%u frames)",
+                   mono_rate, published_mono, total);
+        RCLCPP_INFO(this->get_logger(), "Color publish rate: %.1f%% (%u/%u expected)",
+                   color_rate, published_color, total / 10);
     }
 }
 
 // ============================================================
-// Publisher Thread Loop (Event-Driven)
+// Mono Publisher Thread Loop (20 Hz, Event-Driven)
 // ============================================================
-// This thread waits on a condition variable and publishes frames instantly
-// when notified by the camera callback. Uses ZERO CPU when idle.
-//
-// IMPORTANT: IMU-camera synchronization is preserved because:
-// - Timestamps are captured from trigger_map in onRequestCompleted()
-// - The timestamp is already set in the message before notification
-// - This thread just publishes the pre-timestamped message
-// ============================================================
-void CameraDisplayNode::publisherThreadLoop() {
-    while (publisher_running_) {
-        std::unique_lock<std::mutex> lock(publish_mutex_);
+void CameraDisplayNode::publisherThreadLoopMono() {
+    while (publisher_running_mono_) {
+        std::unique_lock<std::mutex> lock(publish_mutex_mono_);
 
         // Wait for notification (blocks with zero CPU usage)
-        publish_cv_.wait(lock, [this] {
-            return frame_ready_to_publish_ || !publisher_running_;
+        publish_cv_mono_.wait(lock, [this] {
+            return frame_ready_to_publish_mono_ || !publisher_running_mono_;
         });
 
         // Exit if shutting down
-        if (!publisher_running_) {
+        if (!publisher_running_mono_) {
             break;
         }
 
-        // Publish frame
-        if (frame_ready_to_publish_) {
+        // Publish mono frame
+        if (frame_ready_to_publish_mono_) {
             auto publish_start = std::chrono::steady_clock::now();
-            image_pub_->publish(pending_msg_);
+            image_pub_mono_->publish(pending_msg_mono_);
             auto publish_end = std::chrono::steady_clock::now();
 
-            // Update publish time metric (for monitoring, not part of callback time)
-            double pub_time = std::chrono::duration<double>(publish_end - publish_start).count() * 1e6;
-            publish_time_us_ = pub_time;
+            publish_time_mono_us_ = std::chrono::duration<double>(publish_end - publish_start).count() * 1e6;
+            frame_ready_to_publish_mono_ = false;
+        }
+    }
+}
 
-            frame_ready_to_publish_ = false;
+// ============================================================
+// Color Publisher Thread Loop (2 Hz, Event-Driven)
+// ============================================================
+void CameraDisplayNode::publisherThreadLoopColor() {
+    while (publisher_running_color_) {
+        std::unique_lock<std::mutex> lock(publish_mutex_color_);
+
+        // Wait for notification (blocks with zero CPU usage)
+        publish_cv_color_.wait(lock, [this] {
+            return frame_ready_to_publish_color_ || !publisher_running_color_;
+        });
+
+        // Exit if shutting down
+        if (!publisher_running_color_) {
+            break;
+        }
+
+        // Publish color frame
+        if (frame_ready_to_publish_color_) {
+            auto publish_start = std::chrono::steady_clock::now();
+            image_pub_color_->publish(pending_msg_color_);
+            auto publish_end = std::chrono::steady_clock::now();
+
+            publish_time_color_us_ = std::chrono::duration<double>(publish_end - publish_start).count() * 1e6;
+            frame_ready_to_publish_color_ = false;
         }
     }
 }
@@ -505,16 +551,18 @@ void CameraDisplayNode::onRequestCompleted(libcamera::Request * req) {
             if (enable_pico_sync_) {
                 uint32_t matched = frames_matched_.load();
                 uint32_t received = frames_received_.load();
-                uint32_t skipped = frames_skipped_.load();
                 double match_rate = (received > 0) ? (100.0 * matched / received) : 0.0;
                 RCLCPP_INFO(this->get_logger(),
-                           "FPS: %.1f | Sync: %.0f%% | Drops: %u | Skipped: %u | CB: %.0fµs | Pub: %.0fµs",
-                           smoothed_fps_, match_rate,
-                           frame_drops_.load(), skipped, callback_time_us_, publish_time_us_);
+                           "FPS: %.1f | Sync: %.0f%% | CB: %.0fµs [Conv:%.0f Mem:%.0f] | Mono: %.0fµs | Color: %.0fµs",
+                           smoothed_fps_, match_rate, callback_time_us_,
+                           convert_time_us_, memcpy_time_us_,
+                           publish_time_mono_us_, publish_time_color_us_);
             } else {
                 RCLCPP_INFO(this->get_logger(),
-                           "FPS: %.1f | Skipped: %u | CB: %.0fµs | Pub: %.0fµs",
-                           smoothed_fps_, frames_skipped_.load(), callback_time_us_, publish_time_us_);
+                           "FPS: %.1f | CB: %.0fµs [Conv:%.0f Mem:%.0f] | Mono: %.0fµs | Color: %.0fµs",
+                           smoothed_fps_, callback_time_us_,
+                           convert_time_us_, memcpy_time_us_,
+                           publish_time_mono_us_, publish_time_color_us_);
             }
 
             frames_since_log_ = 0;
@@ -522,18 +570,17 @@ void CameraDisplayNode::onRequestCompleted(libcamera::Request * req) {
         }
 
         // ============================================================
-        // Prepare Message for Async Publish
+        // Prepare Messages for Async Dual Publish
         // ============================================================
-        // This section prepares the ROS message but does NOT publish it.
-        // Publishing happens in onPublishTimer() to avoid blocking camera.
-        // Key optimization: Reduces callback from 1700µs → 800µs
+        // Mono @ 20 Hz (every frame) + Color @ 2 Hz (every 10th frame)
         // ============================================================
 
-        const size_t dst_step = static_cast<size_t>(width_) * 3;
-        const size_t frame_size = dst_step * static_cast<size_t>(height_);
+        const size_t dst_step_color = static_cast<size_t>(width_) * 3;
+        const size_t dst_step_mono = static_cast<size_t>(width_);
+        const size_t frame_size_color = dst_step_color * static_cast<size_t>(height_);
+        const size_t frame_size_mono = dst_step_mono * static_cast<size_t>(height_);
 
-        // Step 1: Determine timestamp from trigger synchronization
-        // Timestamp is captured HERE, before async publish, to preserve IMU sync
+        // Determine timestamp from trigger synchronization
         rclcpp::Time frame_timestamp;
         if (enable_pico_sync_) {
             rclcpp::Time frame_time = getFrameTimestamp(frame_id);
@@ -547,49 +594,94 @@ void CameraDisplayNode::onRequestCompleted(libcamera::Request * req) {
             frame_timestamp = this->now();
         }
 
-        // Step 2: Fill message metadata (pre-allocated buffer, minimal overhead)
+        // Frame decimation: publish color every 10th frame (2 Hz @ 20 FPS)
+        frame_counter_++;
+        bool publish_color_frame = (frame_counter_ % 10 == 0);
+
         auto alloc_start = std::chrono::steady_clock::now();
-        reusable_msg_.header.stamp = frame_timestamp;
-        reusable_msg_.header.frame_id = "camera_link";
-        reusable_msg_.width = width_;
-        reusable_msg_.height = height_;
-        reusable_msg_.encoding = "bgr8";
-        reusable_msg_.is_bigendian = false;
-        reusable_msg_.step = width_ * 3;
-        reusable_msg_.data.resize(frame_size);  // No allocation (already reserved)
+
+        // === MONO MESSAGE (every frame) ===
+        reusable_msg_mono_.header.stamp = frame_timestamp;
+        reusable_msg_mono_.header.frame_id = "camera_link";
+        reusable_msg_mono_.width = width_;
+        reusable_msg_mono_.height = height_;
+        reusable_msg_mono_.encoding = "mono8";
+        reusable_msg_mono_.is_bigendian = false;
+        reusable_msg_mono_.step = width_;
+        reusable_msg_mono_.data.resize(frame_size_mono);
+
+        // === COLOR MESSAGE (every 10th frame) ===
+        if (publish_color_frame) {
+            reusable_msg_color_.header.stamp = frame_timestamp;
+            reusable_msg_color_.header.frame_id = "camera_link";
+            reusable_msg_color_.width = width_;
+            reusable_msg_color_.height = height_;
+            reusable_msg_color_.encoding = "bgr8";
+            reusable_msg_color_.is_bigendian = false;
+            reusable_msg_color_.step = width_ * 3;
+            reusable_msg_color_.data.resize(frame_size_color);
+        }
+
         auto alloc_end = std::chrono::steady_clock::now();
         alloc_time_us_ = std::chrono::duration<double>(alloc_end - alloc_start).count() * 1e6;
 
-        // Step 3: Copy frame data (bulk memcpy if stride matches)
-        uint8_t * dst = reusable_msg_.data.data();
+        // === COPY BGR DATA (for color, if needed) ===
         auto memcpy_start = std::chrono::steady_clock::now();
-        if (stride_ == dst_step) {
-            // Fast path: Single bulk copy for standard stride
-            std::memcpy(dst, src, frame_size);
-        } else {
-            // Slow path: Row-by-row copy for non-standard stride
-            for (size_t r = 0; r < static_cast<size_t>(height_); ++r) {
-                std::memcpy(dst + r * dst_step, src + r * stride_, dst_step);
+        if (publish_color_frame) {
+            uint8_t * dst_color = reusable_msg_color_.data.data();
+            if (stride_ == dst_step_color) {
+                std::memcpy(dst_color, src, frame_size_color);
+            } else {
+                for (size_t r = 0; r < static_cast<size_t>(height_); ++r) {
+                    std::memcpy(dst_color + r * dst_step_color, src + r * stride_, dst_step_color);
+                }
             }
         }
         auto memcpy_end = std::chrono::steady_clock::now();
         memcpy_time_us_ = std::chrono::duration<double>(memcpy_end - memcpy_start).count() * 1e6;
 
-        // Step 4: Notify publisher thread (event-driven, instant wakeup)
+        // === CONVERT BGR → MONO IN CALLBACK (fast fixed-point conversion) ===
+        auto convert_start = std::chrono::steady_clock::now();
+        uint8_t* dst_mono = reusable_msg_mono_.data.data();
+
+        for (size_t r = 0; r < static_cast<size_t>(height_); ++r) {
+            const uint8_t* src_row = src + r * stride_;
+            uint8_t* dst_row = dst_mono + r * static_cast<size_t>(width_);
+
+            for (size_t c = 0; c < static_cast<size_t>(width_); ++c) {
+                const uint8_t b = src_row[c * 3 + 0];
+                const uint8_t g = src_row[c * 3 + 1];
+                const uint8_t r_val = src_row[c * 3 + 2];
+                // Fixed-point: Y = (77*R + 150*G + 29*B) >> 8
+                dst_row[c] = static_cast<uint8_t>((77 * r_val + 150 * g + 29 * b) >> 8);
+            }
+        }
+        auto convert_end = std::chrono::steady_clock::now();
+        convert_time_us_ = std::chrono::duration<double>(convert_end - convert_start).count() * 1e6;
+
+        // === NOTIFY MONO PUBLISHER (every frame) ===
         {
-            std::lock_guard<std::mutex> lock(publish_mutex_);
-            if (!frame_ready_to_publish_) {
-                // Publisher is ready, swap and notify
-                std::swap(pending_msg_, reusable_msg_);
-                frame_ready_to_publish_ = true;
-                publish_cv_.notify_one();
+            std::lock_guard<std::mutex> lock(publish_mutex_mono_);
+            if (!frame_ready_to_publish_mono_) {
+                std::swap(pending_msg_mono_, reusable_msg_mono_);
+                frame_ready_to_publish_mono_ = true;
+                publish_cv_mono_.notify_one();
             } else {
-                // Publisher still busy with previous frame, skip this one
-                frames_skipped_++;
+                frames_skipped_mono_++;
             }
         }
 
-        publish_time_us_ = 0.0;  // Will be updated by publisher thread
+        // === NOTIFY COLOR PUBLISHER (every 10th frame) ===
+        if (publish_color_frame) {
+            std::lock_guard<std::mutex> lock(publish_mutex_color_);
+            if (!frame_ready_to_publish_color_) {
+                std::swap(pending_msg_color_, reusable_msg_color_);
+                frame_ready_to_publish_color_ = true;
+                publish_cv_color_.notify_one();
+            } else {
+                frames_skipped_color_++;
+            }
+        }
     }
 
 requeue:

@@ -17,7 +17,7 @@ public:
     CameraFpsSubscriber() : Node("camera_fps_subscriber"), running_(true) {
         // Subscribe to camera image topic
         image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
-            "/camera/image_display",
+            "/camera/image_mono",
             rclcpp::SensorDataQoS(),
             std::bind(&CameraFpsSubscriber::imageCallback, this, std::placeholders::_1)
         );
@@ -53,7 +53,7 @@ private:
 
         // Convert ROS image to OpenCV Mat (non-blocking)
         try {
-            int cv_type = CV_8UC3; // Default to BGR8
+            int cv_type = CV_8UC1; // Default to BGR8
             
             // Create Mat from ROS image data
             cv::Mat frame(msg->height, msg->width, cv_type, const_cast<uint8_t*>(msg->data.data()), msg->step);
