@@ -238,9 +238,9 @@ void setup() {
   add_repeating_timer_ms(CAMERA_PERIOD_MS, cameraTimerCallback, NULL, &cameraTimer);
 
   // Success indicator
-  digitalWrite(LED_BUILTIN, HIGH);
-  delay(500);
   digitalWrite(LED_BUILTIN, LOW);
+  delay(500);
+  digitalWrite(LED_BUILTIN, HIGH);
 }
 
 // ======================== MAIN LOOP ========================
