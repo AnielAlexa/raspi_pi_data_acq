@@ -99,14 +99,14 @@ void bmpInterruptHandler() {
   bmpDataReady = true;
 }
 
-void blinkLED(int times) {
-  for (int i = 0; i < times; i++) {
+// Simple fatal indicator: blink forever to signal a non-working state
+void failBlinkForever(uint16_t onMs = 150, uint16_t offMs = 150) {
+  while (true) {
     digitalWrite(LED_BUILTIN, HIGH);
-    delay(200);
+    delay(onMs);
     digitalWrite(LED_BUILTIN, LOW);
-    delay(200);
+    delay(offMs);
   }
-  delay(1000);
 }
 
 void setup() {
@@ -114,16 +114,10 @@ void setup() {
   pinMode(PIN_CAMERA_TRIGGER, OUTPUT);
   digitalWrite(PIN_CAMERA_TRIGGER, LOW);
 
-  // Test 1: Basic LED (1 blink)
-  blinkLED(1);
-  delay(1000);
-
-  // Test 2: Serial init (2 blinks)
+  // Serial init
   Serial1.begin(230400);
-  blinkLED(2);
-  delay(1000);
   
-  // Test 3: SPI0 init (3 blinks)
+  // SPI0 init
   pinMode(PIN_CS_ACCEL, OUTPUT);
   pinMode(PIN_CS_GYRO, OUTPUT);
   digitalWrite(PIN_CS_ACCEL, HIGH);
@@ -133,10 +127,8 @@ void setup() {
   SPI.setTX(PIN_SPI_MOSI);
   SPI.setSCK(PIN_SPI_SCK);
   SPI.begin();
-  blinkLED(3);
-  delay(1000);
   
-  // Test 4: BMI088 init with sync + interrupt (4 blinks)
+  // BMI088 init with sync + interrupt
   int status;
   status = bmi.begin();
   if (status > 0) {
@@ -163,36 +155,30 @@ void setup() {
     pinMode(PIN_IMU_INT, INPUT);
     attachInterrupt(digitalPinToInterrupt(PIN_IMU_INT), imuInterruptHandler, RISING);
 
-    blinkLED(4);
   } else {
-    // BMI088 failed - continuous fast blink
-    while(1) {
-      digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-      delay(100);
-    }
+    // BMI088 failed - indicate non-working
+    failBlinkForever();
   }
-  delay(1000);
   
-  // Test 5: I2C0 (BMP388) init (5 blinks)
+  // I2C0 (BMP388) init
   Wire.setSDA(PIN_BMP_SDA);
   Wire.setSCL(PIN_BMP_SCL);
   Wire.begin();
-  blinkLED(5);
-  delay(1000);
 
-  // Test 6: BMP388 init with interrupt/FIFO (6 blinks)
+  // BMP388 init with interrupt
   // Try default address (0x77), then alternate (0x76)
   if (!bmp388.begin()) {
     if (!bmp388.begin(0x76)) {
-    while(1) {
-      digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-      delay(500);
-    }
+      failBlinkForever();
     }
   }
-  // Configure I2C clock and ODR/filter for BMP388
+  // Configure I2C clock and baro settings for drone altimeter
+  // Goals: low jitter under prop wash, reasonable latency, minimal MCU load
   bmp388.setClock(400000);                      // 400 kHz I2C on Wire
-  bmp388.setTimeStandby(TIME_STANDBY_80MS);     // 12.5 Hz ~ 10 Hz
+  bmp388.setPresOversampling(OVERSAMPLING_X8);  // Good noise rejection without excessive lag
+  bmp388.setTempOversampling(OVERSAMPLING_X2);  // Temperature mainly for compensation
+  bmp388.setIIRFilter(IIR_FILTER_8);            // Light smoothing for vibration environments
+  bmp388.setTimeStandby(TIME_STANDBY_80MS);     // ~12.5 Hz update rate (sufficient for altitude hold)
   bmp388.setSeaLevelPressure(SEALEVEL_HPA);
 
   // Enable data ready interrupt (open-drain active-low is common on breakouts)
@@ -213,10 +199,7 @@ void setup() {
   pinMode(PIN_BMP_INT, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN_BMP_INT), bmpInterruptHandler, FALLING);
 
-  blinkLED(6);
-  delay(1000);
-
-  // Test 7: Success! (solid ON)
+  // Success: solid ON (working)
   // WIRING:
   //   BMI088 INT2 → Pi Pico GPIO 21 (IMU data-ready @ 400 Hz)
   //   BMP388 INT  → Pi Pico GPIO 14 (altimeter data-ready @ ~10 Hz)
