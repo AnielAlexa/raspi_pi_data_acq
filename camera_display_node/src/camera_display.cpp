@@ -1,18 +1,17 @@
 // camera_display.cpp
-// ROS2 node that captures video from libcamera, synced with Pico triggers.
-// Integrates with SerialReader to match frames with hardware trigger events.
-// Minimal overhead: request completion callback handles everything.
+// ROS2 node that captures video from V4L2 (Arducam JetVariety), synced with Pico triggers.
+// Event-driven capture using select() on V4L2 fd — zero CPU when idle.
 
 #include "camera_display_node/camera_display_node.h"
 
-#include <libcamera/formats.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/select.h>
 #include <unistd.h>
 #include <cerrno>
-
 #include <cstring>
-#include <iostream>
-#include <map>
+
 #include <rclcpp/executors/multi_threaded_executor.hpp>
 
 // ============================================================
@@ -20,26 +19,28 @@
 // ============================================================
 CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
                                          enable_pico_sync_(true),
+                                         trigger_map_max_size_(20),
+                                         expected_frame_id_(0),
+                                         altitude_baseline_set_(false),
+                                         altitude_baseline_m_(0.0f),
                                          frames_received_(0),
                                          frames_matched_(0),
-                                         frame_drops_(0),
-                                         expected_frame_id_(0),
-                                         trigger_map_max_size_(20),
-                                         altitude_baseline_set_(false),
-                                         altitude_baseline_m_(0.0f)
+                                         frame_drops_(0)
 {
     // Declare parameters
     camera_index_ = this->declare_parameter<int>("camera_index", 0);
-    width_ = this->declare_parameter<int>("width", 640);
-    height_ = this->declare_parameter<int>("height", 480);
+    width_ = this->declare_parameter<int>("width", 1280);
+    height_ = this->declare_parameter<int>("height", 720);
     std::string serial_port = this->declare_parameter<std::string>("serial_port", "/dev/ttyAMA0");
     enable_pico_sync_ = this->declare_parameter<bool>("enable_pico_sync", true);
-
+    exposure_ = this->declare_parameter<int>("exposure", 700);
+    analogue_gain_ = this->declare_parameter<int>("analogue_gain", 400);
+    trigger_mode_enabled_ = this->declare_parameter<bool>("trigger_mode", true);
 
     rclcpp::QoS mono_qos(
     rclcpp::QoSInitialization(
         RMW_QOS_POLICY_HISTORY_KEEP_LAST,
-        2 // tiny buffer, just in case consumer stutters briefly
+        2
     )
     );
     mono_qos.reliable();
@@ -48,16 +49,16 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     rclcpp::QoS imu_qos(
     rclcpp::QoSInitialization(
         RMW_QOS_POLICY_HISTORY_KEEP_LAST,
-        50 // keep last N IMU messages
+        50
     )
     );
-    imu_qos.reliable();             // don't drop IMU
+    imu_qos.reliable();
     imu_qos.durability_volatile();
 
     rclcpp::QoS range_qos(
     rclcpp::QoSInitialization(
         RMW_QOS_POLICY_HISTORY_KEEP_LAST,
-        10 // keep last N altimeter messages
+        10
     )
     );
     range_qos.reliable();
@@ -66,21 +67,17 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     // Create publishers
     image_pub_mono_ = this->create_publisher<sensor_msgs::msg::Image>(
         "/camera/image_mono", mono_qos);
-    image_pub_color_ = this->create_publisher<sensor_msgs::msg::Image>(
-        "/camera/image_color", mono_qos);
     imu_pub_ = this->create_publisher<sensor_msgs::msg::Imu>(
         "/imu/data_raw", imu_qos);
     range_pub_ = this->create_publisher<sensor_msgs::msg::Range>(
         "/altimeter/range", range_qos);
 
-    if (!initCamera()) {
-        RCLCPP_ERROR(this->get_logger(), "Failed to initialize camera");
-        throw std::runtime_error("Failed to initialize camera");
+    if (!initV4L2()) {
+        RCLCPP_ERROR(this->get_logger(), "Failed to initialize V4L2 camera");
+        throw std::runtime_error("Failed to initialize V4L2 camera");
     }
 
-    // Pre-allocate message buffers to avoid per-frame allocations
-    // NV12: Y plane (width*height) + UV plane (width*height/2) = 1.5x size
-    const size_t frame_size_yuv = static_cast<size_t>(width_) * static_cast<size_t>(height_) * 3 / 2;
+    // Pre-allocate message buffers
     const size_t frame_size_mono = static_cast<size_t>(width_) * static_cast<size_t>(height_);
 
     reusable_msg_mono_.header.frame_id = "camera_link";
@@ -89,34 +86,21 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     reusable_msg_mono_.width = width_;
     reusable_msg_mono_.height = height_;
     reusable_msg_mono_.step = width_;
-
-    // Pre-size, not just reserve
     reusable_msg_mono_.data.resize(frame_size_mono);
 
-    pending_msg_mono_ = reusable_msg_mono_; // copies metadata + allocates its own buffer
-    // Make sure it also has correct size and capacity
+    pending_msg_mono_ = reusable_msg_mono_;
     pending_msg_mono_.data.resize(frame_size_mono);
 
-    // --- YUV buffers ---
-    reusable_msg_color_.header.frame_id = "camera_link";
-    reusable_msg_color_.encoding = "yuv420";  // NV12 is compatible with yuv420
-    reusable_msg_color_.is_bigendian = false;
-    reusable_msg_color_.width = width_;
-    reusable_msg_color_.height = height_;
-    reusable_msg_color_.step = width_;  // Y plane stride
-
-    reusable_msg_color_.data.resize(frame_size_yuv);
-    pending_msg_color_ = reusable_msg_color_;
-    pending_msg_color_.data.resize(frame_size_yuv);
-
-    // Start event-driven publisher threads
-    // Mono @ 20 Hz for VIO, Color @ 2 Hz for visualization
+    // Start event-driven publisher thread
     publisher_running_mono_ = true;
-    publisher_running_color_ = true;
+    frame_ready_to_publish_mono_ = false;
     publisher_thread_mono_ = std::thread(&CameraDisplayNode::publisherThreadLoopMono, this);
-    publisher_thread_color_ = std::thread(&CameraDisplayNode::publisherThreadLoopColor, this);
 
-    RCLCPP_INFO(this->get_logger(), "Camera ready: %dx%d | Mono@20Hz + Color@2Hz (event-driven)",
+    // Start capture thread
+    capture_running_ = true;
+    capture_thread_ = std::thread(&CameraDisplayNode::captureThreadLoop, this);
+
+    RCLCPP_INFO(this->get_logger(), "Camera ready: %dx%d | Mono@20Hz (event-driven V4L2)",
                width_, height_);
 
     // Initialize FPS tracking
@@ -129,13 +113,9 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     callback_time_us_ = 0.0;
     memcpy_time_us_ = 0.0;
     convert_time_us_ = 0.0;
-    alloc_time_us_ = 0.0;
     publish_time_mono_us_ = 0.0;
-    publish_time_color_us_ = 0.0;
     slow_callbacks_ = 0;
     frames_skipped_mono_ = 0;
-    frames_skipped_color_ = 0;
-    frame_counter_ = 0;
 
     // Initialize Pico serial synchronization if enabled
     if (enable_pico_sync_) {
@@ -147,7 +127,15 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
 // Destructor
 // ============================================================
 CameraDisplayNode::~CameraDisplayNode() {
-    // Stop publisher threads
+    // Stop capture thread
+    if (capture_running_) {
+        capture_running_ = false;
+        if (capture_thread_.joinable()) {
+            capture_thread_.join();
+        }
+    }
+
+    // Stop publisher thread
     if (publisher_running_mono_) {
         publisher_running_mono_ = false;
         publish_cv_mono_.notify_one();
@@ -156,38 +144,11 @@ CameraDisplayNode::~CameraDisplayNode() {
         }
     }
 
-    if (publisher_running_color_) {
-        publisher_running_color_ = false;
-        publish_cv_color_.notify_one();
-        if (publisher_thread_color_.joinable()) {
-            publisher_thread_color_.join();
-        }
-    }
-
     if (serial_sync_) {
         serial_sync_->stop();
     }
 
-    if (camera_) {
-        camera_->stop();
-
-        for (auto & kv : mappings_) {
-            for (auto & pl : kv.second.planes) {
-                if (pl.addr && pl.length) {
-                    munmap(pl.addr, pl.length);
-                }
-            }
-        }
-        mappings_.clear();
-
-        camera_->release();
-        camera_.reset();
-    }
-
-    if (camera_manager_) {
-        camera_manager_->stop();
-        camera_manager_.reset();
-    }
+    cleanupV4L2();
 
     // Log final synchronization statistics
     if (enable_pico_sync_) {
@@ -198,178 +159,441 @@ CameraDisplayNode::~CameraDisplayNode() {
 }
 
 // ============================================================
-// Camera Initialization
+// V4L2 Initialization
 // ============================================================
-bool CameraDisplayNode::initCamera() {
-    // Initialize camera manager
-    camera_manager_ = std::make_unique<libcamera::CameraManager>();
-    if (camera_manager_->start()) {
-        RCLCPP_ERROR(this->get_logger(), "CameraManager start failed");
-        return false;
-    }
-    if (camera_manager_->cameras().empty()) {
-        RCLCPP_ERROR(this->get_logger(), "No cameras found");
-        return false;
-    }
-    if (static_cast<size_t>(camera_index_) >= camera_manager_->cameras().size()) {
-        RCLCPP_ERROR(this->get_logger(), "Camera index %d out of range", camera_index_);
+bool CameraDisplayNode::initV4L2() {
+    // Open V4L2 device
+    std::string dev_path = "/dev/video" + std::to_string(camera_index_);
+    v4l2_fd_ = open(dev_path.c_str(), O_RDWR);
+    if (v4l2_fd_ < 0) {
+        RCLCPP_ERROR(this->get_logger(), "Failed to open %s: %s",
+                    dev_path.c_str(), strerror(errno));
         return false;
     }
 
-    camera_ = camera_manager_->cameras()[camera_index_];
-    if (camera_->acquire()) {
-        RCLCPP_ERROR(this->get_logger(), "Failed to acquire camera");
+    // Verify capabilities
+    struct v4l2_capability cap;
+    if (ioctl(v4l2_fd_, VIDIOC_QUERYCAP, &cap) < 0) {
+        RCLCPP_ERROR(this->get_logger(), "VIDIOC_QUERYCAP failed: %s", strerror(errno));
+        return false;
+    }
+    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
+        RCLCPP_ERROR(this->get_logger(), "Device does not support video capture");
+        return false;
+    }
+    if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
+        RCLCPP_ERROR(this->get_logger(), "Device does not support streaming");
+        return false;
+    }
+    RCLCPP_INFO(this->get_logger(), "V4L2 device: %s (%s)", cap.card, cap.driver);
+
+    // Set pixel format
+    struct v4l2_format fmt;
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width = width_;
+    fmt.fmt.pix.height = height_;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_Y16;
+    fmt.fmt.pix.field = V4L2_FIELD_NONE;
+
+    if (ioctl(v4l2_fd_, VIDIOC_S_FMT, &fmt) < 0) {
+        RCLCPP_ERROR(this->get_logger(), "VIDIOC_S_FMT failed: %s", strerror(errno));
         return false;
     }
 
-    // Configure as RGB888 viewfinder
-    std::unique_ptr<libcamera::CameraConfiguration> config =
-        camera_->generateConfiguration({ libcamera::StreamRole::Viewfinder });
-    if (!config) {
-        RCLCPP_ERROR(this->get_logger(), "generateConfiguration failed");
+    // Update from driver response (may differ from request)
+    width_ = fmt.fmt.pix.width;
+    height_ = fmt.fmt.pix.height;
+    v4l2_stride_ = fmt.fmt.pix.bytesperline;
+    RCLCPP_INFO(this->get_logger(), "V4L2 format: %dx%d, stride=%u, pixfmt=0x%08X",
+               width_, height_, v4l2_stride_, fmt.fmt.pix.pixelformat);
+
+    // Request mmap buffers
+    struct v4l2_requestbuffers reqbufs;
+    memset(&reqbufs, 0, sizeof(reqbufs));
+    reqbufs.count = NUM_V4L2_BUFFERS;
+    reqbufs.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    reqbufs.memory = V4L2_MEMORY_MMAP;
+
+    if (ioctl(v4l2_fd_, VIDIOC_REQBUFS, &reqbufs) < 0) {
+        RCLCPP_ERROR(this->get_logger(), "VIDIOC_REQBUFS failed: %s", strerror(errno));
         return false;
     }
-
-    libcamera::StreamConfiguration & stream_cfg = config->at(0);
-    stream_cfg.pixelFormat = libcamera::formats::NV12;
-    stream_cfg.size.width  = width_;
-    stream_cfg.size.height = height_;
-
-    if (config->validate() == libcamera::CameraConfiguration::Invalid) {
-        RCLCPP_ERROR(this->get_logger(), "Invalid configuration");
-        return false;
-    }
-    if (camera_->configure(config.get()) < 0) {
-        RCLCPP_ERROR(this->get_logger(), "camera->configure failed");
-        return false;
+    if (static_cast<int>(reqbufs.count) < NUM_V4L2_BUFFERS) {
+        RCLCPP_WARN(this->get_logger(), "Requested %d buffers, got %u",
+                   NUM_V4L2_BUFFERS, reqbufs.count);
     }
 
-    width_  = stream_cfg.size.width;
-    height_ = stream_cfg.size.height;
-    stride_ = stream_cfg.stride;
-    stream_ = stream_cfg.stream();
+    // Query and mmap each buffer
+    for (int i = 0; i < static_cast<int>(reqbufs.count) && i < NUM_V4L2_BUFFERS; ++i) {
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
 
-    // Allocate frame buffers
-    allocator_ = std::make_unique<libcamera::FrameBufferAllocator>(camera_);
-    if (allocator_->allocate(stream_) < 0) {
-        RCLCPP_ERROR(this->get_logger(), "Buffer allocation failed");
-        return false;
-    }
-    const auto & bufs = allocator_->buffers(stream_);
-    if (bufs.empty()) {
-        RCLCPP_ERROR(this->get_logger(), "No buffers allocated");
-        return false;
-    }
-
-    // mmap planes
-    mappings_.reserve(bufs.size());
-    for (const auto & uptr : bufs) {
-        libcamera::FrameBuffer * fb = uptr.get();
-        MappedBuffer mb;
-        mb.planes.resize(fb->planes().size());
-
-        // Track which file descriptors we've already mapped
-        std::map<int, void*> fd_mappings;
-
-        for (size_t p = 0; p < fb->planes().size(); ++p) {
-            const libcamera::FrameBuffer::Plane & pl = fb->planes()[p];
-            int fd = pl.fd.get();
-
-            void * base_addr = nullptr;
-
-            // Check if we've already mapped this FD
-            auto it = fd_mappings.find(fd);
-            if (it != fd_mappings.end()) {
-                // Reuse existing mapping, adjust by offset
-                base_addr = it->second;
-            } else {
-                // First time mapping this FD - map from offset 0 with full length
-                // For contiguous multi-plane formats, calculate total size needed
-                size_t total_length = pl.offset + pl.length;
-
-                // Check if there are more planes sharing this FD
-                for (size_t next_p = p + 1; next_p < fb->planes().size(); ++next_p) {
-                    const libcamera::FrameBuffer::Plane & next_pl = fb->planes()[next_p];
-                    if (next_pl.fd.get() == fd) {
-                        size_t end_offset = next_pl.offset + next_pl.length;
-                        if (end_offset > total_length) {
-                            total_length = end_offset;
-                        }
-                    }
-                }
-
-                base_addr = mmap(nullptr, total_length, PROT_READ,
-                                MAP_SHARED, fd, 0);
-                if (base_addr == MAP_FAILED) {
-                    RCLCPP_ERROR(this->get_logger(),
-                               "mmap failed on plane %zu: errno=%d (%s), fd=%d, total_length=%zu",
-                               p, errno, strerror(errno), fd, total_length);
-                    return false;
-                }
-                fd_mappings[fd] = base_addr;
-            }
-
-            // Store pointer to plane data (base + offset)
-            mb.planes[p] = {
-                static_cast<uint8_t*>(base_addr) + pl.offset,
-                pl.length
-            };
-        }
-        mappings_.emplace(fb, std::move(mb));
-    }
-
-    // Create request pool
-    requests_.reserve(bufs.size());
-    for (const auto & uptr : bufs) {
-        libcamera::FrameBuffer * fb = uptr.get();
-        auto req = camera_->createRequest();
-        if (!req) {
-            RCLCPP_ERROR(this->get_logger(), "createRequest failed");
-            return false;
-        }
-        if (req->addBuffer(stream_, fb) < 0) {
-            RCLCPP_ERROR(this->get_logger(), "addBuffer failed");
+        if (ioctl(v4l2_fd_, VIDIOC_QUERYBUF, &buf) < 0) {
+            RCLCPP_ERROR(this->get_logger(), "VIDIOC_QUERYBUF[%d] failed: %s",
+                        i, strerror(errno));
             return false;
         }
 
-        requests_.push_back(std::move(req));
+        v4l2_buffers_[i].length = buf.length;
+        v4l2_buffers_[i].start = mmap(nullptr, buf.length,
+                                       PROT_READ | PROT_WRITE, MAP_SHARED,
+                                       v4l2_fd_, buf.m.offset);
+        if (v4l2_buffers_[i].start == MAP_FAILED) {
+            RCLCPP_ERROR(this->get_logger(), "mmap[%d] failed: %s", i, strerror(errno));
+            v4l2_buffers_[i].start = nullptr;
+            return false;
+        }
     }
 
-    // Connect completion signal to callback
-    camera_->requestCompleted.connect(
-        camera_.get(),
-        std::bind(&CameraDisplayNode::onRequestCompleted, this, std::placeholders::_1)
-    );
+    // Queue all buffers
+    for (int i = 0; i < static_cast<int>(reqbufs.count) && i < NUM_V4L2_BUFFERS; ++i) {
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
 
-    // Optional: disable AE/AWB for consistent exposure
-    libcamera::ControlList controls(camera_->controls());
-    controls.set(libcamera::controls::AeEnable, false);
-    controls.set(libcamera::controls::AwbEnable, false);
-    controls.set(libcamera::controls::ExposureTime, 3000); // 3000 µs = 3 ms shutter
-// analog gain (sensor gain)
-    controls.set(libcamera::controls::AnalogueGain, 4.0f); 
+        if (ioctl(v4l2_fd_, VIDIOC_QBUF, &buf) < 0) {
+            RCLCPP_ERROR(this->get_logger(), "VIDIOC_QBUF[%d] failed: %s",
+                        i, strerror(errno));
+            return false;
+        }
+    }
 
-    if (camera_->start(&controls) < 0) {
-        RCLCPP_ERROR(this->get_logger(), "camera->start failed");
+    // Set exposure and gain
+    struct v4l2_control ctrl;
+
+    ctrl.id = V4L2_CID_EXPOSURE;
+    ctrl.value = exposure_;
+    if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
+        RCLCPP_WARN(this->get_logger(), "Failed to set exposure=%d: %s",
+                   exposure_, strerror(errno));
+    } else {
+        RCLCPP_INFO(this->get_logger(), "Exposure set to %d", exposure_);
+    }
+
+    ctrl.id = V4L2_CID_ANALOGUE_GAIN;
+    ctrl.value = analogue_gain_;
+    if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
+        RCLCPP_WARN(this->get_logger(), "Failed to set analogue_gain=%d: %s",
+                   analogue_gain_, strerror(errno));
+    } else {
+        RCLCPP_INFO(this->get_logger(), "Analogue gain set to %d", analogue_gain_);
+    }
+
+    // Start streaming
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(v4l2_fd_, VIDIOC_STREAMON, &type) < 0) {
+        RCLCPP_ERROR(this->get_logger(), "VIDIOC_STREAMON failed: %s", strerror(errno));
         return false;
     }
 
-    // Queue all requests to start streaming
-    for (auto & req : requests_) {
-        if (camera_->queueRequest(req.get()) < 0) {
-            RCLCPP_ERROR(this->get_logger(), "queueRequest failed");
-            return false;
+    RCLCPP_INFO(this->get_logger(), "V4L2 streaming started, draining %d initial frames...",
+               DRAIN_FRAME_COUNT);
+
+    // Drain initial stale frames
+    for (int i = 0; i < DRAIN_FRAME_COUNT; ++i) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(v4l2_fd_, &fds);
+        struct timeval tv;
+        tv.tv_sec = 2;
+        tv.tv_usec = 0;
+
+        int ret = select(v4l2_fd_ + 1, &fds, nullptr, nullptr, &tv);
+        if (ret <= 0) {
+            RCLCPP_WARN(this->get_logger(), "Drain frame %d: select timeout or error", i);
+            continue;
         }
+
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+
+        if (ioctl(v4l2_fd_, VIDIOC_DQBUF, &buf) < 0) {
+            RCLCPP_WARN(this->get_logger(), "Drain DQBUF failed: %s", strerror(errno));
+            continue;
+        }
+        if (ioctl(v4l2_fd_, VIDIOC_QBUF, &buf) < 0) {
+            RCLCPP_WARN(this->get_logger(), "Drain QBUF failed: %s", strerror(errno));
+        }
+    }
+
+    RCLCPP_INFO(this->get_logger(), "Drain complete");
+
+    // Enable trigger mode if requested
+    if (trigger_mode_enabled_) {
+        usleep(1000000);  // 1s settle time before switching to trigger mode
+        enableTriggerMode();
     }
 
     return true;
 }
 
 // ============================================================
+// Enable Arducam Trigger Mode
+// ============================================================
+void CameraDisplayNode::enableTriggerMode() {
+    // Arducam JetVariety custom control IDs
+    // These are driver-specific; use v4l2-ctl --list-ctrls to find them
+    // Typical Arducam trigger_mode control ID
+    const uint32_t ARDUCAM_TRIGGER_MODE_ID = 0x009a2000;
+    const uint32_t ARDUCAM_FRAME_TIMEOUT_ID = 0x009a2004;
+
+    struct v4l2_control ctrl;
+
+    // Enable trigger mode
+    ctrl.id = ARDUCAM_TRIGGER_MODE_ID;
+    ctrl.value = 1;
+    if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
+        RCLCPP_WARN(this->get_logger(),
+                   "Failed to set trigger_mode via ioctl (0x%08X): %s. Trying v4l2-ctl fallback...",
+                   ARDUCAM_TRIGGER_MODE_ID, strerror(errno));
+        // Fallback: use v4l2-ctl command
+        std::string cmd = "v4l2-ctl -d /dev/video" + std::to_string(camera_index_) +
+                         " -c trigger_mode=1";
+        int ret = system(cmd.c_str());
+        if (ret != 0) {
+            RCLCPP_ERROR(this->get_logger(), "v4l2-ctl trigger_mode=1 failed (ret=%d)", ret);
+            return;
+        }
+    }
+    RCLCPP_INFO(this->get_logger(), "Trigger mode enabled");
+
+    // Set frame timeout (ms) — how long to wait before reporting no frame
+    ctrl.id = ARDUCAM_FRAME_TIMEOUT_ID;
+    ctrl.value = 2000;
+    if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
+        RCLCPP_WARN(this->get_logger(),
+                   "Failed to set frame_timeout via ioctl (0x%08X): %s. Trying v4l2-ctl fallback...",
+                   ARDUCAM_FRAME_TIMEOUT_ID, strerror(errno));
+        std::string cmd = "v4l2-ctl -d /dev/video" + std::to_string(camera_index_) +
+                         " -c frame_timeout=2000";
+        int ret = system(cmd.c_str());
+        if (ret != 0) {
+            RCLCPP_WARN(this->get_logger(), "v4l2-ctl frame_timeout=2000 failed (ret=%d)", ret);
+        }
+    } else {
+        RCLCPP_INFO(this->get_logger(), "Frame timeout set to 2000ms");
+    }
+}
+
+// ============================================================
+// V4L2 Cleanup
+// ============================================================
+void CameraDisplayNode::cleanupV4L2() {
+    if (v4l2_fd_ < 0) return;
+
+    // Stop streaming
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &type);
+
+    // Unmap buffers
+    for (auto& buf : v4l2_buffers_) {
+        if (buf.start && buf.start != MAP_FAILED) {
+            munmap(buf.start, buf.length);
+            buf.start = nullptr;
+        }
+    }
+
+    close(v4l2_fd_);
+    v4l2_fd_ = -1;
+}
+
+// ============================================================
+// V4L2 Capture Thread Loop (Event-Driven)
+// ============================================================
+void CameraDisplayNode::captureThreadLoop() {
+    while (capture_running_) {
+        // select() blocks until a frame is ready — zero CPU when idle
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(v4l2_fd_, &fds);
+        struct timeval tv;
+        tv.tv_sec = 2;
+        tv.tv_usec = 0;
+
+        int ret = select(v4l2_fd_ + 1, &fds, nullptr, nullptr, &tv);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            RCLCPP_ERROR(this->get_logger(), "select() failed: %s", strerror(errno));
+            break;
+        }
+        if (ret == 0) {
+            // Timeout — normal in trigger mode when no triggers arriving
+            continue;
+        }
+
+        auto callback_start = std::chrono::steady_clock::now();
+
+        // Dequeue frame
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+
+        if (ioctl(v4l2_fd_, VIDIOC_DQBUF, &buf) < 0) {
+            if (errno == EAGAIN) continue;
+            RCLCPP_ERROR(this->get_logger(), "VIDIOC_DQBUF failed: %s", strerror(errno));
+            break;
+        }
+
+        frames_received_++;
+
+        // --- Sequence → Frame ID calibration ---
+        uint16_t frame_id;
+        if (enable_pico_sync_) {
+            if (!sequence_calibrated_.load()) {
+                uint16_t expected = expected_frame_id_.load();
+                if (expected > 0) {
+                    // Pico has sent at least one trigger — calibrate
+                    sequence_to_frame_id_offset_ = static_cast<int32_t>(expected) - static_cast<int32_t>(buf.sequence);
+                    sequence_calibrated_ = true;
+                    RCLCPP_INFO(this->get_logger(),
+                               "Sequence calibrated: V4L2 seq=%u → frame_id=%u (offset=%d)",
+                               buf.sequence, expected, sequence_to_frame_id_offset_);
+                }
+            }
+            frame_id = static_cast<uint16_t>((static_cast<int32_t>(buf.sequence) + sequence_to_frame_id_offset_) & 0xFFFF);
+        } else {
+            frame_id = static_cast<uint16_t>(buf.sequence & 0xFFFF);
+        }
+
+        // --- Frame drop detection ---
+        if (enable_pico_sync_ && expected_frame_id_ > 0 && sequence_calibrated_.load()) {
+            uint16_t expected = expected_frame_id_ + 1;
+            if (frame_id != expected) {
+                if ((frame_id > expected) || (frame_id == 0 && expected == 0xFFFF)) {
+                    uint16_t drop_count = (frame_id > expected) ?
+                                         (frame_id - expected) :
+                                         (0xFFFF - expected + frame_id + 1);
+                    frame_drops_ += drop_count;
+                    RCLCPP_DEBUG(this->get_logger(),
+                               "Frame drop: expected %u, got %u (dropped %u)",
+                               expected, frame_id, drop_count);
+                }
+            }
+        }
+
+        // --- FPS Calculation ---
+        auto now = std::chrono::steady_clock::now();
+        double dt = std::chrono::duration<double>(now - last_frame_time_).count();
+        last_frame_time_ = now;
+
+        if (dt > 0.0) {
+            double inst_fps = 1.0 / dt;
+            double alpha = 0.1;
+            smoothed_fps_ = (smoothed_fps_ == 0.0) ? inst_fps :
+                           (alpha * inst_fps + (1.0 - alpha) * smoothed_fps_);
+        }
+        frames_since_log_++;
+
+        // Log stats every 5 seconds
+        if (std::chrono::duration<double>(now - last_log_time_).count() >= 5.0) {
+            if (enable_pico_sync_) {
+                uint32_t matched = frames_matched_.load();
+                uint32_t received = frames_received_.load();
+                double match_rate = (received > 0) ? (100.0 * matched / received) : 0.0;
+                RCLCPP_INFO(this->get_logger(),
+                           "FPS: %.1f | Sync: %.0f%% | CB: %.0fµs [Conv:%.0f Mem:%.0f] | Mono: %.0fµs",
+                           smoothed_fps_, match_rate, callback_time_us_,
+                           convert_time_us_, memcpy_time_us_, publish_time_mono_us_);
+            } else {
+                RCLCPP_INFO(this->get_logger(),
+                           "FPS: %.1f | CB: %.0fµs [Conv:%.0f Mem:%.0f] | Mono: %.0fµs",
+                           smoothed_fps_, callback_time_us_,
+                           convert_time_us_, memcpy_time_us_, publish_time_mono_us_);
+            }
+            frames_since_log_ = 0;
+            last_log_time_ = now;
+        }
+
+        // --- Timestamp lookup ---
+        rclcpp::Time frame_timestamp;
+        if (enable_pico_sync_) {
+            rclcpp::Time frame_time = getFrameTimestamp(frame_id);
+            if (frame_time.nanoseconds() > 0) {
+                frame_timestamp = frame_time;
+                frames_matched_++;
+            } else {
+                frame_timestamp = this->now();
+            }
+        } else {
+            frame_timestamp = this->now();
+        }
+
+        // --- Y16 → mono8 conversion ---
+        auto convert_start = std::chrono::steady_clock::now();
+
+        const void *frame_ptr = v4l2_buffers_[buf.index].start;
+        // Wrap mmap'd Y16 buffer as CV mat
+        cv::Mat raw16(height_, width_, CV_16UC1, const_cast<void*>(frame_ptr), v4l2_stride_);
+        cv::Mat mono8;
+        cv::normalize(raw16, mono8, 0, 255, cv::NORM_MINMAX, CV_8UC1);
+
+        auto convert_end = std::chrono::steady_clock::now();
+        convert_time_us_ = std::chrono::duration<double>(convert_end - convert_start).count() * 1e6;
+
+        // --- Copy to message buffer ---
+        auto memcpy_start = std::chrono::steady_clock::now();
+
+        reusable_msg_mono_.header.stamp = frame_timestamp;
+
+        const size_t dst_step = static_cast<size_t>(width_);
+        const size_t frame_size_mono = dst_step * static_cast<size_t>(height_);
+        uint8_t* dst_mono = reusable_msg_mono_.data.data();
+
+        if (static_cast<size_t>(mono8.step[0]) == dst_step) {
+            std::memcpy(dst_mono, mono8.data, frame_size_mono);
+        } else {
+            for (int r = 0; r < height_; ++r) {
+                std::memcpy(dst_mono + r * dst_step,
+                           mono8.ptr(r), dst_step);
+            }
+        }
+
+        auto memcpy_end = std::chrono::steady_clock::now();
+        memcpy_time_us_ = std::chrono::duration<double>(memcpy_end - memcpy_start).count() * 1e6;
+
+        // --- Notify publisher ---
+        {
+            std::lock_guard<std::mutex> lock(publish_mutex_mono_);
+            if (!frame_ready_to_publish_mono_) {
+                std::swap(pending_msg_mono_, reusable_msg_mono_);
+                frame_ready_to_publish_mono_ = true;
+                publish_cv_mono_.notify_one();
+            } else {
+                frames_skipped_mono_++;
+            }
+        }
+
+        // --- Requeue buffer ---
+        if (ioctl(v4l2_fd_, VIDIOC_QBUF, &buf) < 0) {
+            RCLCPP_ERROR(this->get_logger(), "VIDIOC_QBUF requeue failed: %s", strerror(errno));
+        }
+
+        // --- Measure callback time ---
+        auto callback_end = std::chrono::steady_clock::now();
+        callback_time_us_ = std::chrono::duration<double>(callback_end - callback_start).count() * 1e6;
+
+        if (callback_time_us_ > 5000.0) {
+            slow_callbacks_++;
+            RCLCPP_DEBUG(this->get_logger(),
+                        "Slow callback: %.1f µs (convert: %.1f µs, memcpy: %.1f µs)",
+                        callback_time_us_, convert_time_us_, memcpy_time_us_);
+        }
+    }
+}
+
+// ============================================================
 // Pico Synchronization Initialization
 // ============================================================
 void CameraDisplayNode::initPicoSync(const std::string& serial_port) {
-    // Create serial sync with IMU, trigger, and altimeter callbacks
     serial_sync_ = std::make_unique<camera_display_node::SerialSync>(
         this,
         serial_port,
@@ -383,10 +607,8 @@ void CameraDisplayNode::initPicoSync(const std::string& serial_port) {
                  std::placeholders::_1, std::placeholders::_2)
     );
 
-    // Start serial reader
     serial_sync_->start();
 
-    // Wait for time calibration
     uint32_t wait_count = 0;
     while (rclcpp::ok() && !serial_sync_->is_calibrated() && wait_count < 50) {
         rclcpp::sleep_for(std::chrono::milliseconds(100));
@@ -407,23 +629,19 @@ void CameraDisplayNode::onImuPacket(uint32_t timestamp_us, float ax, float ay, f
                                      float gx, float gy, float gz) {
     if (!serial_sync_ || !imu_pub_) return;
 
-    // Create and publish IMU message
     sensor_msgs::msg::Imu imu_msg;
     imu_msg.header.stamp = serial_sync_->pico_to_ros_time(timestamp_us);
     imu_msg.header.frame_id = "imu_link";
 
-    // Linear acceleration
     imu_msg.linear_acceleration.x = ax;
     imu_msg.linear_acceleration.y = ay;
     imu_msg.linear_acceleration.z = az;
 
-    // Angular velocity
     imu_msg.angular_velocity.x = gx;
     imu_msg.angular_velocity.y = gy;
     imu_msg.angular_velocity.z = gz;
 
-    // Covariances
-    imu_msg.orientation_covariance[0] = -1.0;  // No orientation
+    imu_msg.orientation_covariance[0] = -1.0;
     imu_msg.linear_acceleration_covariance[0] = 0.01;
     imu_msg.angular_velocity_covariance[0] = 0.01;
 
@@ -436,27 +654,23 @@ void CameraDisplayNode::onImuPacket(uint32_t timestamp_us, float ax, float ay, f
 void CameraDisplayNode::onAltimeterPacket(uint32_t timestamp_us, float altitude_m) {
     if (!serial_sync_ || !range_pub_) return;
 
-    // Zero-reset: capture first altitude reading as baseline
     if (!altitude_baseline_set_.load()) {
         altitude_baseline_m_ = altitude_m;
         altitude_baseline_set_.store(true);
         RCLCPP_INFO(this->get_logger(), "Altimeter baseline set: %.3f m (will be zeroed)", altitude_m);
     }
 
-    // Apply baseline correction to guarantee 0.000m at ROS startup
     float relative_altitude_m = altitude_m - altitude_baseline_m_;
 
-    // Create and publish Range message
     sensor_msgs::msg::Range range_msg;
     range_msg.header.stamp = serial_sync_->pico_to_ros_time(timestamp_us);
     range_msg.header.frame_id = "altimeter";
 
-    // BMP388 altimeter specifications
-    range_msg.radiation_type = sensor_msgs::msg::Range::INFRARED;  // Closest type for barometric
-    range_msg.field_of_view = 0.0;  // N/A for barometric sensor
-    range_msg.min_range = -500.0;   // BMP388 can handle -500m to +9000m
+    range_msg.radiation_type = sensor_msgs::msg::Range::INFRARED;
+    range_msg.field_of_view = 0.0;
+    range_msg.min_range = -500.0;
     range_msg.max_range = 9000.0;
-    range_msg.range = relative_altitude_m;   // Relative altitude (zeroed at ROS startup)
+    range_msg.range = relative_altitude_m;
 
     range_pub_->publish(range_msg);
 }
@@ -467,24 +681,19 @@ void CameraDisplayNode::onAltimeterPacket(uint32_t timestamp_us, float altitude_
 void CameraDisplayNode::onTriggerPacket(uint32_t timestamp_us, uint16_t frame_id) {
     if (!serial_sync_) return;
 
-    // Convert Pico time to ROS time
     rclcpp::Time trigger_time;
     if (serial_sync_->is_calibrated()) {
-        // Use the conversion function (time offset already applied)
         trigger_time = serial_sync_->pico_to_ros_time(timestamp_us);
     } else {
         trigger_time = this->now();
     }
 
-    // Store trigger in map and update latest
     {
         std::lock_guard<std::mutex> lock(trigger_map_mutex_);
         trigger_map_[frame_id] = trigger_time;
         latest_trigger_time_ = trigger_time;
 
-        // Prune old entries if map is too large
         if (trigger_map_.size() > trigger_map_max_size_) {
-            // Remove oldest entries (lower frame_ids)
             auto it = trigger_map_.begin();
             for (size_t i = 0; i < 5 && it != trigger_map_.end(); ++i) {
                 it = trigger_map_.erase(it);
@@ -492,7 +701,6 @@ void CameraDisplayNode::onTriggerPacket(uint32_t timestamp_us, uint16_t frame_id
         }
     }
 
-    // Update expected frame counter
     expected_frame_id_ = frame_id;
 }
 
@@ -505,7 +713,6 @@ rclcpp::Time CameraDisplayNode::getFrameTimestamp(uint16_t frame_id) {
     if (it != trigger_map_.end()) {
         return it->second;
     }
-    // Fallback: use latest trigger or current time
     return this->now();
 }
 
@@ -517,27 +724,22 @@ void CameraDisplayNode::logSyncStats() {
     RCLCPP_INFO(this->get_logger(), "Total frames received: %u", frames_received_.load());
     RCLCPP_INFO(this->get_logger(), "Frames matched to trigger: %u", frames_matched_.load());
     RCLCPP_INFO(this->get_logger(), "Frame drops detected: %u", frame_drops_.load());
-    RCLCPP_INFO(this->get_logger(), "Frames skipped - Mono: %u, Color: %u",
-               frames_skipped_mono_.load(), frames_skipped_color_.load());
+    RCLCPP_INFO(this->get_logger(), "Frames skipped (publisher busy): %u",
+               frames_skipped_mono_.load());
     RCLCPP_INFO(this->get_logger(), "Slow callbacks (>5ms): %u", slow_callbacks_.load());
-    RCLCPP_INFO(this->get_logger(), "Publishing mode: Dual stream (Mono@20Hz + Color@2Hz, event-driven)");
-    RCLCPP_INFO(this->get_logger(), "Last callback: %.1f µs [alloc: %.1f, convert: %.1f, memcpy: %.1f]",
-               callback_time_us_, alloc_time_us_, convert_time_us_, memcpy_time_us_);
-    RCLCPP_INFO(this->get_logger(), "Last publish: Mono %.1f µs, Color %.1f µs",
-               publish_time_mono_us_, publish_time_color_us_);
+    RCLCPP_INFO(this->get_logger(), "Publishing mode: Mono@20Hz (event-driven V4L2)");
+    RCLCPP_INFO(this->get_logger(), "Last callback: %.1f µs [convert: %.1f, memcpy: %.1f]",
+               callback_time_us_, convert_time_us_, memcpy_time_us_);
+    RCLCPP_INFO(this->get_logger(), "Last publish: Mono %.1f µs", publish_time_mono_us_);
 
     uint32_t total = frames_received_.load();
     uint32_t published_mono = total - frames_skipped_mono_.load();
-    uint32_t published_color = (total / 10) - frames_skipped_color_.load();
     if (total > 0) {
         double match_rate = (100.0 * frames_matched_.load()) / total;
         double mono_rate = (100.0 * published_mono) / total;
-        double color_rate = (100.0 * published_color * 10) / total;  // Normalize to 100%
         RCLCPP_INFO(this->get_logger(), "Match rate: %.1f%%", match_rate);
         RCLCPP_INFO(this->get_logger(), "Mono publish rate: %.1f%% (%u/%u frames)",
                    mono_rate, published_mono, total);
-        RCLCPP_INFO(this->get_logger(), "Color publish rate: %.1f%% (%u/%u expected)",
-                   color_rate, published_color, total / 10);
     }
 }
 
@@ -548,17 +750,14 @@ void CameraDisplayNode::publisherThreadLoopMono() {
     while (publisher_running_mono_) {
         std::unique_lock<std::mutex> lock(publish_mutex_mono_);
 
-        // Wait for notification (blocks with zero CPU usage)
         publish_cv_mono_.wait(lock, [this] {
             return frame_ready_to_publish_mono_ || !publisher_running_mono_;
         });
 
-        // Exit if shutting down
         if (!publisher_running_mono_) {
             break;
         }
 
-        // Publish mono frame
         if (frame_ready_to_publish_mono_) {
             auto publish_start = std::chrono::steady_clock::now();
             image_pub_mono_->publish(pending_msg_mono_);
@@ -571,273 +770,12 @@ void CameraDisplayNode::publisherThreadLoopMono() {
 }
 
 // ============================================================
-// Color Publisher Thread Loop (2 Hz, Event-Driven)
-// ============================================================
-void CameraDisplayNode::publisherThreadLoopColor() {
-    while (publisher_running_color_) {
-        std::unique_lock<std::mutex> lock(publish_mutex_color_);
-
-        // Wait for notification (blocks with zero CPU usage)
-        publish_cv_color_.wait(lock, [this] {
-            return frame_ready_to_publish_color_ || !publisher_running_color_;
-        });
-
-        // Exit if shutting down
-        if (!publisher_running_color_) {
-            break;
-        }
-
-        // Publish color frame
-        if (frame_ready_to_publish_color_) {
-            auto publish_start = std::chrono::steady_clock::now();
-            image_pub_color_->publish(pending_msg_color_);
-            auto publish_end = std::chrono::steady_clock::now();
-
-            publish_time_color_us_ = std::chrono::duration<double>(publish_end - publish_start).count() * 1e6;
-            frame_ready_to_publish_color_ = false;
-        }
-    }
-}
-
-// ============================================================
-// Camera Frame Completion Callback
-// ============================================================
-void CameraDisplayNode::onRequestCompleted(libcamera::Request * req) {
-    auto callback_start = std::chrono::steady_clock::now();
-
-    if (req->status() == libcamera::Request::RequestCancelled) {
-        return;
-    }
-
-    frames_received_++;
-
-    // Get frame sequence number
-    uint64_t frame_sequence = req->sequence();
-    uint16_t frame_id = static_cast<uint16_t>(frame_sequence & 0xFFFF);
-
-    // Detect frame drops (if sync enabled)
-    if (enable_pico_sync_ && expected_frame_id_ > 0) {
-        uint16_t expected = expected_frame_id_ + 1;
-        if (frame_id != expected) {
-            // Check if it's a drop or just out-of-order
-            if ((frame_id > expected) || (frame_id == 0 && expected == 0xFFFF)) {
-                uint16_t drop_count = (frame_id > expected) ?
-                                     (frame_id - expected) :
-                                     (0xFFFF - expected + frame_id + 1);
-                frame_drops_ += drop_count;
-                RCLCPP_DEBUG(this->get_logger(),
-                           "Frame drop detected: expected %u, got %u (dropped %u frames)",
-                           expected, frame_id, drop_count);
-            }
-        }
-    }
-
-    // Find buffer for this request
-    const auto & buffers_map = req->buffers();
-    auto it = buffers_map.find(stream_);
-    if (it == buffers_map.end()) {
-        RCLCPP_WARN(this->get_logger(), "Request without stream buffer");
-        goto requeue;
-    }
-
-    {
-        libcamera::FrameBuffer * fb = it->second;
-        auto mit = mappings_.find(fb);
-        if (mit == mappings_.end()) {
-            RCLCPP_WARN(this->get_logger(), "Missing mapping for buffer");
-            goto requeue;
-        }
-
-        const uint8_t * src = static_cast<const uint8_t*>(mit->second.planes[0].addr);
-
-        // --- FPS Calculation ---
-        auto now = std::chrono::steady_clock::now();
-        double dt = std::chrono::duration<double>(now - last_frame_time_).count();
-        last_frame_time_ = now;
-
-        if (dt > 0.0) {
-            double inst_fps = 1.0 / dt;
-            double alpha = 0.1;  // Smoothing factor
-            smoothed_fps_ = (smoothed_fps_ == 0.0) ? inst_fps :
-                           (alpha * inst_fps + (1.0 - alpha) * smoothed_fps_);
-        }
-        frames_since_log_++;
-
-        // Log average FPS and sync stats every 5 seconds
-        if (std::chrono::duration<double>(now - last_log_time_).count() >= 5.0) {
-            if (enable_pico_sync_) {
-                uint32_t matched = frames_matched_.load();
-                uint32_t received = frames_received_.load();
-                double match_rate = (received > 0) ? (100.0 * matched / received) : 0.0;
-                RCLCPP_INFO(this->get_logger(),
-                           "FPS: %.1f | Sync: %.0f%% | CB: %.0fµs [Conv:%.0f Mem:%.0f] | Mono: %.0fµs | Color: %.0fµs",
-                           smoothed_fps_, match_rate, callback_time_us_,
-                           convert_time_us_, memcpy_time_us_,
-                           publish_time_mono_us_, publish_time_color_us_);
-            } else {
-                RCLCPP_INFO(this->get_logger(),
-                           "FPS: %.1f | CB: %.0fµs [Conv:%.0f Mem:%.0f] | Mono: %.0fµs | Color: %.0fµs",
-                           smoothed_fps_, callback_time_us_,
-                           convert_time_us_, memcpy_time_us_,
-                           publish_time_mono_us_, publish_time_color_us_);
-            }
-
-            frames_since_log_ = 0;
-            last_log_time_ = now;
-        }
-
-        // ============================================================
-        // Prepare Messages for Async Dual Publish
-        // ============================================================
-        // Mono @ 20 Hz (every frame) + Color @ 2 Hz (every 10th frame)
-        // ============================================================
-
-        const size_t dst_step_yuv = static_cast<size_t>(width_);  // Y plane stride
-        const size_t dst_step_mono = static_cast<size_t>(width_);
-        const size_t frame_size_mono = dst_step_mono * static_cast<size_t>(height_);
-
-        // Determine timestamp from trigger synchronization
-        rclcpp::Time frame_timestamp;
-        if (enable_pico_sync_) {
-            rclcpp::Time frame_time = getFrameTimestamp(frame_id);
-            if (frame_time.nanoseconds() > 0) {
-                frame_timestamp = frame_time;
-                frames_matched_++;
-            } else {
-                frame_timestamp = this->now();
-            }
-        } else {
-            frame_timestamp = this->now();
-        }
-
-        // Frame decimation: publish color every 10th frame (2 Hz @ 20 FPS)
-        frame_counter_++;
-        bool publish_color_frame = (frame_counter_ % 10 == 0);
-
-        auto alloc_start = std::chrono::steady_clock::now();
-
-        // === MONO MESSAGE (every frame) ===
-        reusable_msg_mono_.header.stamp = frame_timestamp;
-        // reusable_msg_mono_.header.frame_id = "camera_link";
-        // reusable_msg_mono_.width = width_;
-        // reusable_msg_mono_.height = height_;
-        // reusable_msg_mono_.encoding = "mono8";
-        // reusable_msg_mono_.is_bigendian = false;
-        // reusable_msg_mono_.step = width_;
-        // reusable_msg_mono_.data.resize(frame_size_mono);
-
-        // === COLOR MESSAGE (every 10th frame) ===
-        if (publish_color_frame) {
-            reusable_msg_color_.header.stamp = frame_timestamp;
-            // reusable_msg_color_.header.frame_id = "camera_link";
-            // reusable_msg_color_.width = width_;
-            // reusable_msg_color_.height = height_;
-            // reusable_msg_color_.encoding = "bgr8";
-            // reusable_msg_color_.is_bigendian = false;
-            // reusable_msg_color_.step = width_ * 3;
-            // reusable_msg_color_.data.resize(frame_size_color);
-        }
-
-        auto alloc_end = std::chrono::steady_clock::now();
-        alloc_time_us_ = std::chrono::duration<double>(alloc_end - alloc_start).count() * 1e6;
-
-        // === EXTRACT Y-PLANE FOR MONO (every frame @ 20 Hz) ===
-        // NV12 format: plane[0] = Y channel (already mono!)
-        auto convert_start = std::chrono::steady_clock::now();
-        uint8_t* dst_mono = reusable_msg_mono_.data.data();
-
-        if (stride_ == dst_step_mono) {
-            // Fast path: direct memcpy
-            std::memcpy(dst_mono, src, frame_size_mono);
-        } else {
-            // Stride differs: row-by-row copy
-            for (size_t r = 0; r < static_cast<size_t>(height_); ++r) {
-                std::memcpy(dst_mono + r * dst_step_mono, src + r * stride_, dst_step_mono);
-            }
-        }
-        auto convert_end = std::chrono::steady_clock::now();
-        convert_time_us_ = std::chrono::duration<double>(convert_end - convert_start).count() * 1e6;
-
-        // === COPY NV12 DATA (Y + UV planes for YUV, every 10th frame @ 2 Hz) ===
-        auto memcpy_start = std::chrono::steady_clock::now();
-        if (publish_color_frame) {
-            uint8_t * dst_yuv = reusable_msg_color_.data.data();
-
-            // Copy Y plane (plane[0])
-            const uint8_t* y_plane = src;  // Y is in plane[0]
-            size_t y_plane_size = static_cast<size_t>(width_) * static_cast<size_t>(height_);
-
-            if (stride_ == dst_step_yuv) {
-                std::memcpy(dst_yuv, y_plane, y_plane_size);
-            } else {
-                for (size_t r = 0; r < static_cast<size_t>(height_); ++r) {
-                    std::memcpy(dst_yuv + r * dst_step_yuv, y_plane + r * stride_, dst_step_yuv);
-                }
-            }
-
-            // Copy UV plane (plane[1]) - interleaved U and V
-            if (mit->second.planes.size() > 1) {
-                const uint8_t* uv_plane = static_cast<const uint8_t*>(mit->second.planes[1].addr);
-                size_t uv_plane_size = y_plane_size / 2;  // UV is half the size of Y
-                std::memcpy(dst_yuv + y_plane_size, uv_plane, uv_plane_size);
-            }
-        }
-        auto memcpy_end = std::chrono::steady_clock::now();
-        memcpy_time_us_ = std::chrono::duration<double>(memcpy_end - memcpy_start).count() * 1e6;
-
-        // === NOTIFY MONO PUBLISHER (every frame) ===
-        {
-            std::lock_guard<std::mutex> lock(publish_mutex_mono_);
-            if (!frame_ready_to_publish_mono_) {
-                std::swap(pending_msg_mono_, reusable_msg_mono_);
-                frame_ready_to_publish_mono_ = true;
-                publish_cv_mono_.notify_one();
-            } else {
-                frames_skipped_mono_++;
-            }
-        }
-
-        // === NOTIFY COLOR PUBLISHER (every 10th frame) ===
-        if (publish_color_frame) {
-            std::lock_guard<std::mutex> lock(publish_mutex_color_);
-            if (!frame_ready_to_publish_color_) {
-                std::swap(pending_msg_color_, reusable_msg_color_);
-                frame_ready_to_publish_color_ = true;
-                publish_cv_color_.notify_one();
-            } else {
-                frames_skipped_color_++;
-            }
-        }
-    }
-
-requeue:
-    // Requeue request for next frame
-    req->reuse(libcamera::Request::ReuseFlag::ReuseBuffers);
-    if (camera_->queueRequest(req) < 0) {
-        RCLCPP_ERROR(this->get_logger(), "re-queueRequest failed");
-    }
-
-    // Measure callback execution time
-    auto callback_end = std::chrono::steady_clock::now();
-    callback_time_us_ = std::chrono::duration<double>(callback_end - callback_start).count() * 1e6;
-
-    // Track slow callbacks (>5ms)
-    if (callback_time_us_ > 5000.0) {
-        slow_callbacks_++;
-        RCLCPP_DEBUG(this->get_logger(),
-                    "Slow callback: %.1f µs (memcpy: %.1f µs)",
-                    callback_time_us_, memcpy_time_us_);
-    }
-}
-
-// ============================================================
 // Main Entry Point
 // ============================================================
 int main(int argc, char **argv) {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<CameraDisplayNode>();
 
-    // Use multi-threaded executor to avoid blocking on GUI
     rclcpp::executors::MultiThreadedExecutor executor;
     executor.add_node(node);
     executor.spin();

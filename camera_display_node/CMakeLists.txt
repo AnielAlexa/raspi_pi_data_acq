@@ -16,9 +16,7 @@ find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
 
-# Find libcamera
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(LIBCAMERA REQUIRED IMPORTED_TARGET libcamera)
+
 
 # Include directories
 include_directories(include)
@@ -41,7 +39,7 @@ ament_target_dependencies(camera_display_node
 )
 
 target_link_libraries(camera_display_node
-  PkgConfig::LIBCAMERA
+  ${OpenCV_LIBS}
 )
 
 # Link dependencies for FPS subscriber
