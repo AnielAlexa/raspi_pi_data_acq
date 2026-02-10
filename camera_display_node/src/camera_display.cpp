@@ -10,6 +10,7 @@
 #include <sys/mman.h>
 #include <sys/select.h>
 #include <unistd.h>
+#include <arm_neon.h>
 #include <cerrno>
 #include <cstring>
 
@@ -78,6 +79,9 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
         throw std::runtime_error("Failed to initialize V4L2 camera");
     }
 
+    // Pre-allocate cached frame buffer (mmap'd V4L2 DMA memory is uncacheable on Tegra)
+    cached_frame_buf_.resize(static_cast<size_t>(v4l2_stride_) * static_cast<size_t>(height_));
+
     // Pre-allocate message buffers
     const size_t frame_size_mono = static_cast<size_t>(width_) * static_cast<size_t>(height_);
 
@@ -123,11 +127,23 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
 
     // Initialize performance metrics
     callback_time_us_ = 0.0;
-    memcpy_time_us_ = 0.0;
     convert_time_us_ = 0.0;
     publish_time_mono_us_ = 0.0;
     slow_callbacks_ = 0;
     frames_skipped_mono_ = 0;
+
+    // Pre-allocate IMU message (static fields set once)
+    reusable_imu_msg_.header.frame_id = "imu_link";
+    reusable_imu_msg_.orientation_covariance[0] = -1.0;
+    reusable_imu_msg_.linear_acceleration_covariance[0] = 0.01;
+    reusable_imu_msg_.angular_velocity_covariance[0] = 0.01;
+
+    // Pre-allocate Range message (static fields set once)
+    reusable_range_msg_.header.frame_id = "altimeter";
+    reusable_range_msg_.radiation_type = sensor_msgs::msg::Range::INFRARED;
+    reusable_range_msg_.field_of_view = 0.0;
+    reusable_range_msg_.min_range = -500.0;
+    reusable_range_msg_.max_range = 9000.0;
 
     // Initialize Pico serial synchronization if enabled
     if (enable_pico_sync_) {
@@ -512,14 +528,14 @@ void CameraDisplayNode::captureThreadLoop() {
                 uint32_t received = frames_received_.load();
                 double match_rate = (received > 0) ? (100.0 * matched / received) : 0.0;
                 RCLCPP_INFO(this->get_logger(),
-                           "FPS: %.1f | Sync: %.0f%% | CB: %.0fµs [Conv:%.0f Mem:%.0f] | Mono: %.0fµs",
+                           "FPS: %.1f | Sync: %.0f%% | CB: %.0fµs [Conv:%.0f] | Mono: %.0fµs",
                            smoothed_fps_, match_rate, callback_time_us_,
-                           convert_time_us_, memcpy_time_us_, publish_time_mono_us_);
+                           convert_time_us_, publish_time_mono_us_);
             } else {
                 RCLCPP_INFO(this->get_logger(),
-                           "FPS: %.1f | CB: %.0fµs [Conv:%.0f Mem:%.0f] | Mono: %.0fµs",
+                           "FPS: %.1f | CB: %.0fµs [Conv:%.0f] | Mono: %.0fµs",
                            smoothed_fps_, callback_time_us_,
-                           convert_time_us_, memcpy_time_us_, publish_time_mono_us_);
+                           convert_time_us_, publish_time_mono_us_);
             }
             frames_since_log_ = 0;
             last_log_time_ = now;
@@ -539,39 +555,37 @@ void CameraDisplayNode::captureThreadLoop() {
             frame_timestamp = this->now();
         }
 
-        // --- Y16 → mono8 conversion ---
+        // --- Y16 → mono8 conversion (cached copy + NEON vshrn) ---
         auto convert_start = std::chrono::steady_clock::now();
-
-        const void *frame_ptr = v4l2_buffers_[buf.index].start;
-        // Wrap mmap'd Y16 buffer as CV mat, then fixed-scale convert to 8-bit
-        // convertTo with alpha=1/256 is a single-pass right-shift — ~50x faster than normalize
-        cv::Mat raw16(height_, width_, CV_16UC1, const_cast<void*>(frame_ptr), v4l2_stride_);
-        cv::Mat mono8;
-        raw16.convertTo(mono8, CV_8UC1, 1.0 / 256.0);
-
-        auto convert_end = std::chrono::steady_clock::now();
-        convert_time_us_ = std::chrono::duration<double>(convert_end - convert_start).count() * 1e6;
-
-        // --- Copy to message buffer ---
-        auto memcpy_start = std::chrono::steady_clock::now();
 
         reusable_msg_mono_.header.stamp = frame_timestamp;
 
-        const size_t dst_step = static_cast<size_t>(width_);
-        const size_t frame_size_mono = dst_step * static_cast<size_t>(height_);
-        uint8_t* dst_mono = reusable_msg_mono_.data.data();
+        // Step 1: bulk-copy from uncacheable DMA mmap → cached heap buffer
+        const size_t frame_bytes = static_cast<size_t>(v4l2_stride_) * static_cast<size_t>(height_);
+        std::memcpy(cached_frame_buf_.data(), v4l2_buffers_[buf.index].start, frame_bytes);
 
-        if (static_cast<size_t>(mono8.step[0]) == dst_step) {
-            std::memcpy(dst_mono, mono8.data, frame_size_mono);
-        } else {
-            for (int r = 0; r < height_; ++r) {
-                std::memcpy(dst_mono + r * dst_step,
-                           mono8.ptr(r), dst_step);
+        // Step 2: NEON shift-right-narrow from cached buffer → message buffer
+        const uint8_t* src_base = cached_frame_buf_.data();
+        uint8_t* dst_base = reusable_msg_mono_.data.data();
+
+        for (int r = 0; r < height_; ++r) {
+            const uint16_t* src_row = reinterpret_cast<const uint16_t*>(src_base + r * v4l2_stride_);
+            uint8_t* dst_row = dst_base + r * width_;
+
+            int c = 0;
+            for (; c + 15 < width_; c += 16) {
+                uint16x8_t v0 = vld1q_u16(src_row + c);
+                uint16x8_t v1 = vld1q_u16(src_row + c + 8);
+                vst1_u8(dst_row + c, vshrn_n_u16(v0, 8));
+                vst1_u8(dst_row + c + 8, vshrn_n_u16(v1, 8));
+            }
+            for (; c < width_; ++c) {
+                dst_row[c] = static_cast<uint8_t>(src_row[c] >> 8);
             }
         }
 
-        auto memcpy_end = std::chrono::steady_clock::now();
-        memcpy_time_us_ = std::chrono::duration<double>(memcpy_end - memcpy_start).count() * 1e6;
+        auto convert_end = std::chrono::steady_clock::now();
+        convert_time_us_ = std::chrono::duration<double>(convert_end - convert_start).count() * 1e6;
 
         // --- Notify publisher ---
         {
@@ -597,8 +611,8 @@ void CameraDisplayNode::captureThreadLoop() {
         if (callback_time_us_ > 5000.0) {
             slow_callbacks_++;
             RCLCPP_DEBUG(this->get_logger(),
-                        "Slow callback: %.1f µs (convert: %.1f µs, memcpy: %.1f µs)",
-                        callback_time_us_, convert_time_us_, memcpy_time_us_);
+                        "Slow callback: %.1f µs (convert: %.1f µs)",
+                        callback_time_us_, convert_time_us_);
         }
     }
 }
@@ -642,23 +656,17 @@ void CameraDisplayNode::onImuPacket(uint32_t timestamp_us, float ax, float ay, f
                                      float gx, float gy, float gz) {
     if (!serial_sync_ || !imu_pub_) return;
 
-    sensor_msgs::msg::Imu imu_msg;
-    imu_msg.header.stamp = serial_sync_->pico_to_ros_time(timestamp_us);
-    imu_msg.header.frame_id = "imu_link";
+    reusable_imu_msg_.header.stamp = serial_sync_->pico_to_ros_time(timestamp_us);
 
-    imu_msg.linear_acceleration.x = ax;
-    imu_msg.linear_acceleration.y = ay;
-    imu_msg.linear_acceleration.z = az;
+    reusable_imu_msg_.linear_acceleration.x = ax;
+    reusable_imu_msg_.linear_acceleration.y = ay;
+    reusable_imu_msg_.linear_acceleration.z = az;
 
-    imu_msg.angular_velocity.x = gx;
-    imu_msg.angular_velocity.y = gy;
-    imu_msg.angular_velocity.z = gz;
+    reusable_imu_msg_.angular_velocity.x = gx;
+    reusable_imu_msg_.angular_velocity.y = gy;
+    reusable_imu_msg_.angular_velocity.z = gz;
 
-    imu_msg.orientation_covariance[0] = -1.0;
-    imu_msg.linear_acceleration_covariance[0] = 0.01;
-    imu_msg.angular_velocity_covariance[0] = 0.01;
-
-    imu_pub_->publish(imu_msg);
+    imu_pub_->publish(reusable_imu_msg_);
 }
 
 // ============================================================
@@ -675,17 +683,10 @@ void CameraDisplayNode::onAltimeterPacket(uint32_t timestamp_us, float altitude_
 
     float relative_altitude_m = altitude_m - altitude_baseline_m_;
 
-    sensor_msgs::msg::Range range_msg;
-    range_msg.header.stamp = serial_sync_->pico_to_ros_time(timestamp_us);
-    range_msg.header.frame_id = "altimeter";
+    reusable_range_msg_.header.stamp = serial_sync_->pico_to_ros_time(timestamp_us);
+    reusable_range_msg_.range = relative_altitude_m;
 
-    range_msg.radiation_type = sensor_msgs::msg::Range::INFRARED;
-    range_msg.field_of_view = 0.0;
-    range_msg.min_range = -500.0;
-    range_msg.max_range = 9000.0;
-    range_msg.range = relative_altitude_m;
-
-    range_pub_->publish(range_msg);
+    range_pub_->publish(reusable_range_msg_);
 }
 
 // ============================================================
@@ -707,9 +708,16 @@ void CameraDisplayNode::onTriggerPacket(uint32_t timestamp_us, uint16_t frame_id
         latest_trigger_time_ = trigger_time;
 
         if (trigger_map_.size() > trigger_map_max_size_) {
+            // Evict entries older than current frame_id (accounting for uint16 wrap)
             auto it = trigger_map_.begin();
-            for (size_t i = 0; i < 5 && it != trigger_map_.end(); ++i) {
-                it = trigger_map_.erase(it);
+            while (it != trigger_map_.end()) {
+                int32_t age = static_cast<int32_t>(frame_id) - static_cast<int32_t>(it->first);
+                if (age < 0) age += 0x10000;  // handle wrap
+                if (age > static_cast<int32_t>(trigger_map_max_size_ / 2)) {
+                    it = trigger_map_.erase(it);
+                } else {
+                    ++it;
+                }
             }
         }
     }
@@ -724,9 +732,11 @@ rclcpp::Time CameraDisplayNode::getFrameTimestamp(uint16_t frame_id) {
     std::lock_guard<std::mutex> lock(trigger_map_mutex_);
     auto it = trigger_map_.find(frame_id);
     if (it != trigger_map_.end()) {
-        return it->second;
+        rclcpp::Time t = it->second;
+        trigger_map_.erase(it);
+        return t;
     }
-    return this->now();
+    return rclcpp::Time(0, 0, RCL_ROS_TIME);
 }
 
 // ============================================================
@@ -741,8 +751,8 @@ void CameraDisplayNode::logSyncStats() {
                frames_skipped_mono_.load());
     RCLCPP_INFO(this->get_logger(), "Slow callbacks (>5ms): %u", slow_callbacks_.load());
     RCLCPP_INFO(this->get_logger(), "Publishing mode: Mono@20Hz (event-driven V4L2)");
-    RCLCPP_INFO(this->get_logger(), "Last callback: %.1f µs [convert: %.1f, memcpy: %.1f]",
-               callback_time_us_, convert_time_us_, memcpy_time_us_);
+    RCLCPP_INFO(this->get_logger(), "Last callback: %.1f µs [convert: %.1f]",
+               callback_time_us_, convert_time_us_);
     RCLCPP_INFO(this->get_logger(), "Last publish: Mono %.1f µs", publish_time_mono_us_);
 
     uint32_t total = frames_received_.load();
@@ -760,6 +770,16 @@ void CameraDisplayNode::logSyncStats() {
 // Mono Publisher Thread Loop (20 Hz, Event-Driven)
 // ============================================================
 void CameraDisplayNode::publisherThreadLoopMono() {
+    // Local buffer avoids holding the mutex during publish (~700µs of DDS serialization)
+    sensor_msgs::msg::Image local_msg;
+    local_msg.header.frame_id = "camera_link";
+    local_msg.encoding = "mono8";
+    local_msg.is_bigendian = false;
+    local_msg.width = width_;
+    local_msg.height = height_;
+    local_msg.step = width_;
+    local_msg.data.resize(static_cast<size_t>(width_) * static_cast<size_t>(height_));
+
     while (publisher_running_mono_) {
         std::unique_lock<std::mutex> lock(publish_mutex_mono_);
 
@@ -772,12 +792,14 @@ void CameraDisplayNode::publisherThreadLoopMono() {
         }
 
         if (frame_ready_to_publish_mono_) {
-            auto publish_start = std::chrono::steady_clock::now();
-            image_pub_mono_->publish(pending_msg_mono_);
-            auto publish_end = std::chrono::steady_clock::now();
-
-            publish_time_mono_us_ = std::chrono::duration<double>(publish_end - publish_start).count() * 1e6;
+            std::swap(local_msg, pending_msg_mono_);
             frame_ready_to_publish_mono_ = false;
+            lock.unlock();
+
+            auto publish_start = std::chrono::steady_clock::now();
+            image_pub_mono_->publish(local_msg);
+            publish_time_mono_us_ = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - publish_start).count() * 1e6;
         }
     }
 }

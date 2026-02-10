@@ -6,8 +6,18 @@ if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 17)
 endif()
 
+# Default to Release (colcon leaves this empty → -O0 on GCC)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
+
+# Jetson Orin Nano: Cortex-A78AE, enables NEON + CRC + crypto instructions
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+  add_compile_options(-march=armv8.2-a+crc+crypto -mtune=cortex-a78ae)
 endif()
 
 # Find dependencies

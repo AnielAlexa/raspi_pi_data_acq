@@ -87,6 +87,8 @@ private:
 
     // Pre-allocated message buffers
     sensor_msgs::msg::Image reusable_msg_mono_;
+    sensor_msgs::msg::Imu reusable_imu_msg_;
+    sensor_msgs::msg::Range reusable_range_msg_;
 
     // Event-driven async publish mechanism - Mono publisher (20 Hz)
     std::thread publisher_thread_mono_;
@@ -113,6 +115,9 @@ private:
     struct V4L2Buffer { void *start = nullptr; size_t length = 0; };
     std::array<V4L2Buffer, NUM_V4L2_BUFFERS> v4l2_buffers_;
     unsigned int v4l2_stride_ = 0;
+
+    // Cached copy of mmap'd frame (DMA buffers are uncacheable on Tegra)
+    std::vector<uint8_t> cached_frame_buf_;
 
     // Capture thread
     std::thread capture_thread_;
@@ -162,7 +167,6 @@ private:
     // Performance Metrics
     // ============================================================
     double callback_time_us_;
-    double memcpy_time_us_;
     double convert_time_us_;
     double publish_time_mono_us_;
     std::atomic<uint32_t> slow_callbacks_;
