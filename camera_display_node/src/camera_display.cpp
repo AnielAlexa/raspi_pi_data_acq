@@ -442,19 +442,13 @@ void CameraDisplayNode::captureThreadLoop() {
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(v4l2_fd_, &fds);
-        struct timeval tv;
-        tv.tv_sec = 2;
-        tv.tv_usec = 0;
 
-        int ret = select(v4l2_fd_ + 1, &fds, nullptr, nullptr, &tv);
+        // Block indefinitely to stay fully event-driven (no polling/timeout)
+        int ret = select(v4l2_fd_ + 1, &fds, nullptr, nullptr, nullptr);
         if (ret < 0) {
             if (errno == EINTR) continue;
             RCLCPP_ERROR(this->get_logger(), "select() failed: %s", strerror(errno));
             break;
-        }
-        if (ret == 0) {
-            // Timeout — normal in trigger mode when no triggers arriving
-            continue;
         }
 
         auto callback_start = std::chrono::steady_clock::now();
