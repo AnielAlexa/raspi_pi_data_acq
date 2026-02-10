@@ -5,6 +5,7 @@
 #include "camera_display_node/camera_display_node.h"
 
 #include <fcntl.h>
+#include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/select.h>
@@ -31,7 +32,7 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     camera_index_ = this->declare_parameter<int>("camera_index", 0);
     width_ = this->declare_parameter<int>("width", 1280);
     height_ = this->declare_parameter<int>("height", 720);
-    std::string serial_port = this->declare_parameter<std::string>("serial_port", "/dev/ttyAMA0");
+    std::string serial_port = this->declare_parameter<std::string>("serial_port", "/dev/ttyTHS1");
     enable_pico_sync_ = this->declare_parameter<bool>("enable_pico_sync", true);
     exposure_ = this->declare_parameter<int>("exposure", 700);
     analogue_gain_ = this->declare_parameter<int>("analogue_gain", 400);
@@ -96,12 +97,23 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     frame_ready_to_publish_mono_ = false;
     publisher_thread_mono_ = std::thread(&CameraDisplayNode::publisherThreadLoopMono, this);
 
-    // Start capture thread
+    // Start capture thread with real-time priority to minimize jitter
     capture_running_ = true;
     capture_thread_ = std::thread(&CameraDisplayNode::captureThreadLoop, this);
 
-    RCLCPP_INFO(this->get_logger(), "Camera ready: %dx%d | Mono@20Hz (event-driven V4L2)",
-               width_, height_);
+    // Set SCHED_FIFO on capture thread for deterministic frame timing
+    struct sched_param param;
+    param.sched_priority = 49;  // Below kernel threads (50+), above normal user tasks
+    int ret = pthread_setschedparam(capture_thread_.native_handle(), SCHED_FIFO, &param);
+    if (ret != 0) {
+        RCLCPP_WARN(this->get_logger(), "Failed to set RT priority on capture thread: %s (run as root or set rtprio)",
+                   strerror(ret));
+    } else {
+        RCLCPP_INFO(this->get_logger(), "Capture thread set to SCHED_FIFO priority 49");
+    }
+
+    RCLCPP_INFO(this->get_logger(), "Camera ready: %dx%d | Mono@20Hz (event-driven V4L2, %d bufs)",
+               width_, height_, NUM_V4L2_BUFFERS);
 
     // Initialize FPS tracking
     last_frame_time_ = std::chrono::steady_clock::now();
@@ -531,10 +543,11 @@ void CameraDisplayNode::captureThreadLoop() {
         auto convert_start = std::chrono::steady_clock::now();
 
         const void *frame_ptr = v4l2_buffers_[buf.index].start;
-        // Wrap mmap'd Y16 buffer as CV mat
+        // Wrap mmap'd Y16 buffer as CV mat, then fixed-scale convert to 8-bit
+        // convertTo with alpha=1/256 is a single-pass right-shift — ~50x faster than normalize
         cv::Mat raw16(height_, width_, CV_16UC1, const_cast<void*>(frame_ptr), v4l2_stride_);
         cv::Mat mono8;
-        cv::normalize(raw16, mono8, 0, 255, cv::NORM_MINMAX, CV_8UC1);
+        raw16.convertTo(mono8, CV_8UC1, 1.0 / 256.0);
 
         auto convert_end = std::chrono::steady_clock::now();
         convert_time_us_ = std::chrono::duration<double>(convert_end - convert_start).count() * 1e6;

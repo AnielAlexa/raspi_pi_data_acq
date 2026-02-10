@@ -107,7 +107,7 @@ private:
     // V4L2 Objects
     // ============================================================
     int v4l2_fd_ = -1;
-    static constexpr int NUM_V4L2_BUFFERS = 4;
+    static constexpr int NUM_V4L2_BUFFERS = 2;
     static constexpr int DRAIN_FRAME_COUNT = 5;
 
     struct V4L2Buffer { void *start = nullptr; size_t length = 0; };

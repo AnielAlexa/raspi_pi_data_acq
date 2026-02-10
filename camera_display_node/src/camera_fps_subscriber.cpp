@@ -17,7 +17,7 @@ public:
     CameraFpsSubscriber() : Node("camera_fps_subscriber"), running_(true) {
         // Subscribe to camera image topic
         image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
-            "/camera/image_color",
+            "/camera/image_mono",
             rclcpp::SensorDataQoS(),
             std::bind(&CameraFpsSubscriber::imageCallback, this, std::placeholders::_1)
         );
