@@ -34,8 +34,8 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     height_ = this->declare_parameter<int>("height", 720);
     std::string serial_port = this->declare_parameter<std::string>("serial_port", "/dev/ttyTHS1");
     enable_pico_sync_ = this->declare_parameter<bool>("enable_pico_sync", true);
-    exposure_ = this->declare_parameter<int>("exposure", 700);
-    analogue_gain_ = this->declare_parameter<int>("analogue_gain", 400);
+    exposure_ = this->declare_parameter<int>("exposure", 1200);
+    analogue_gain_ = this->declare_parameter<int>("analogue_gain", 450);
     trigger_mode_enabled_ = this->declare_parameter<bool>("trigger_mode", true);
 
     rclcpp::QoS mono_qos(
@@ -106,8 +106,15 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     pub_param.sched_priority = 48;
     int pub_ret = pthread_setschedparam(publisher_thread_mono_.native_handle(), SCHED_FIFO, &pub_param);
     if (pub_ret != 0) {
-        RCLCPP_WARN(this->get_logger(), "Failed to set RT priority on publisher thread: %s (run as root or set rtprio)",
-                   strerror(pub_ret));
+        if (pub_ret == EPERM || pub_ret == EACCES) {
+            RCLCPP_INFO(this->get_logger(),
+                       "Publisher RT priority not applied (%s). Continuing with normal scheduler.",
+                       strerror(pub_ret));
+        } else {
+            RCLCPP_WARN(this->get_logger(),
+                       "Failed to set RT priority on publisher thread: %s",
+                       strerror(pub_ret));
+        }
     } else {
         RCLCPP_INFO(this->get_logger(), "Publisher thread set to SCHED_FIFO priority 48");
     }
@@ -121,8 +128,15 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     param.sched_priority = 49;  // Below kernel threads (50+), above normal user tasks
     int ret = pthread_setschedparam(capture_thread_.native_handle(), SCHED_FIFO, &param);
     if (ret != 0) {
-        RCLCPP_WARN(this->get_logger(), "Failed to set RT priority on capture thread: %s (run as root or set rtprio)",
-                   strerror(ret));
+        if (ret == EPERM || ret == EACCES) {
+            RCLCPP_INFO(this->get_logger(),
+                       "Capture RT priority not applied (%s). Continuing with normal scheduler.",
+                       strerror(ret));
+        } else {
+            RCLCPP_WARN(this->get_logger(),
+                       "Failed to set RT priority on capture thread: %s",
+                       strerror(ret));
+        }
     } else {
         RCLCPP_INFO(this->get_logger(), "Capture thread set to SCHED_FIFO priority 49");
     }
@@ -395,35 +409,43 @@ void CameraDisplayNode::enableTriggerMode() {
     ctrl.id = ARDUCAM_TRIGGER_MODE_ID;
     ctrl.value = 1;
     if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
-        RCLCPP_WARN(this->get_logger(),
-                   "Failed to set trigger_mode via ioctl (0x%08X): %s. Trying v4l2-ctl fallback...",
-                   ARDUCAM_TRIGGER_MODE_ID, strerror(errno));
+        const int ioctl_errno = errno;
         // Fallback: use v4l2-ctl command
         std::string cmd = "v4l2-ctl -d /dev/video" + std::to_string(camera_index_) +
                          " -c trigger_mode=1";
         int ret = system(cmd.c_str());
         if (ret != 0) {
-            RCLCPP_ERROR(this->get_logger(), "v4l2-ctl trigger_mode=1 failed (ret=%d)", ret);
+            RCLCPP_ERROR(this->get_logger(),
+                        "trigger_mode failed: ioctl(0x%08X, %s) and v4l2-ctl fallback (ret=%d)",
+                        ARDUCAM_TRIGGER_MODE_ID, strerror(ioctl_errno), ret);
             return;
         }
+        RCLCPP_INFO(this->get_logger(),
+                    "trigger_mode: ioctl unsupported (0x%08X, %s), fallback via v4l2-ctl succeeded",
+                    ARDUCAM_TRIGGER_MODE_ID, strerror(ioctl_errno));
+    } else {
+        RCLCPP_INFO(this->get_logger(), "Trigger mode enabled via ioctl");
     }
-    RCLCPP_INFO(this->get_logger(), "Trigger mode enabled");
 
     // Set frame timeout (ms) — how long to wait before reporting no frame
     ctrl.id = ARDUCAM_FRAME_TIMEOUT_ID;
     ctrl.value = 2000;
     if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
-        RCLCPP_WARN(this->get_logger(),
-                   "Failed to set frame_timeout via ioctl (0x%08X): %s. Trying v4l2-ctl fallback...",
-                   ARDUCAM_FRAME_TIMEOUT_ID, strerror(errno));
+        const int ioctl_errno = errno;
         std::string cmd = "v4l2-ctl -d /dev/video" + std::to_string(camera_index_) +
                          " -c frame_timeout=2000";
         int ret = system(cmd.c_str());
         if (ret != 0) {
-            RCLCPP_WARN(this->get_logger(), "v4l2-ctl frame_timeout=2000 failed (ret=%d)", ret);
+            RCLCPP_WARN(this->get_logger(),
+                       "frame_timeout failed: ioctl(0x%08X, %s) and v4l2-ctl fallback (ret=%d)",
+                       ARDUCAM_FRAME_TIMEOUT_ID, strerror(ioctl_errno), ret);
+        } else {
+            RCLCPP_INFO(this->get_logger(),
+                        "frame_timeout: ioctl unsupported (0x%08X, %s), fallback via v4l2-ctl succeeded",
+                        ARDUCAM_FRAME_TIMEOUT_ID, strerror(ioctl_errno));
         }
     } else {
-        RCLCPP_INFO(this->get_logger(), "Frame timeout set to 2000ms");
+        RCLCPP_INFO(this->get_logger(), "Frame timeout set to 2000ms via ioctl");
     }
 }
 
