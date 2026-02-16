@@ -10,7 +10,6 @@
 #include <sys/mman.h>
 #include <sys/select.h>
 #include <unistd.h>
-#include <arm_neon.h>
 #include <cerrno>
 #include <cstring>
 
@@ -101,6 +100,18 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     frame_ready_to_publish_mono_ = false;
     publisher_thread_mono_ = std::thread(&CameraDisplayNode::publisherThreadLoopMono, this);
 
+    // Give publisher thread high priority too, slightly below capture thread
+    // to reduce occasional scheduling delays that can cause 100ms publish gaps.
+    struct sched_param pub_param;
+    pub_param.sched_priority = 48;
+    int pub_ret = pthread_setschedparam(publisher_thread_mono_.native_handle(), SCHED_FIFO, &pub_param);
+    if (pub_ret != 0) {
+        RCLCPP_WARN(this->get_logger(), "Failed to set RT priority on publisher thread: %s (run as root or set rtprio)",
+                   strerror(pub_ret));
+    } else {
+        RCLCPP_INFO(this->get_logger(), "Publisher thread set to SCHED_FIFO priority 48");
+    }
+
     // Start capture thread with real-time priority to minimize jitter
     capture_running_ = true;
     capture_thread_ = std::thread(&CameraDisplayNode::captureThreadLoop, this);
@@ -158,6 +169,11 @@ CameraDisplayNode::~CameraDisplayNode() {
     // Stop capture thread
     if (capture_running_) {
         capture_running_ = false;
+
+        // Unblock capture thread if it is waiting in select() forever.
+        // cleanupV4L2() is idempotent and safe to call again later.
+        cleanupV4L2();
+
         if (capture_thread_.joinable()) {
             capture_thread_.join();
         }
@@ -221,7 +237,7 @@ bool CameraDisplayNode::initV4L2() {
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     fmt.fmt.pix.width = width_;
     fmt.fmt.pix.height = height_;
-    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_Y16;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_GREY;
     fmt.fmt.pix.field = V4L2_FIELD_NONE;
 
     if (ioctl(v4l2_fd_, VIDIOC_S_FMT, &fmt) < 0) {
@@ -549,7 +565,7 @@ void CameraDisplayNode::captureThreadLoop() {
             frame_timestamp = this->now();
         }
 
-        // --- Y16 → mono8 conversion (cached copy + NEON vshrn) ---
+        // --- GREY/Y8 → mono8 copy (cached copy + row memcpy) ---
         auto convert_start = std::chrono::steady_clock::now();
 
         reusable_msg_mono_.header.stamp = frame_timestamp;
@@ -558,23 +574,19 @@ void CameraDisplayNode::captureThreadLoop() {
         const size_t frame_bytes = static_cast<size_t>(v4l2_stride_) * static_cast<size_t>(height_);
         std::memcpy(cached_frame_buf_.data(), v4l2_buffers_[buf.index].start, frame_bytes);
 
-        // Step 2: NEON shift-right-narrow from cached buffer → message buffer
+        // Step 2: cached buffer → message buffer
         const uint8_t* src_base = cached_frame_buf_.data();
         uint8_t* dst_base = reusable_msg_mono_.data.data();
 
-        for (int r = 0; r < height_; ++r) {
-            const uint16_t* src_row = reinterpret_cast<const uint16_t*>(src_base + r * v4l2_stride_);
-            uint8_t* dst_row = dst_base + r * width_;
-
-            int c = 0;
-            for (; c + 15 < width_; c += 16) {
-                uint16x8_t v0 = vld1q_u16(src_row + c);
-                uint16x8_t v1 = vld1q_u16(src_row + c + 8);
-                vst1_u8(dst_row + c, vshrn_n_u16(v0, 8));
-                vst1_u8(dst_row + c + 8, vshrn_n_u16(v1, 8));
-            }
-            for (; c < width_; ++c) {
-                dst_row[c] = static_cast<uint8_t>(src_row[c] >> 8);
+        // Fast path: tightly packed frame (stride == width)
+        if (v4l2_stride_ == static_cast<unsigned int>(width_)) {
+            std::memcpy(dst_base, src_base,
+                       static_cast<size_t>(width_) * static_cast<size_t>(height_));
+        } else {
+            for (int r = 0; r < height_; ++r) {
+                const uint8_t* src_row = src_base + r * v4l2_stride_;
+                uint8_t* dst_row = dst_base + r * width_;
+                std::memcpy(dst_row, src_row, static_cast<size_t>(width_));
             }
         }
 
@@ -587,10 +599,13 @@ void CameraDisplayNode::captureThreadLoop() {
             if (!frame_ready_to_publish_mono_) {
                 std::swap(pending_msg_mono_, reusable_msg_mono_);
                 frame_ready_to_publish_mono_ = true;
-                publish_cv_mono_.notify_one();
             } else {
+                // Publisher still busy: overwrite pending with newest frame.
+                // This reduces staleness and helps avoid apparent 100ms gaps.
+                std::swap(pending_msg_mono_, reusable_msg_mono_);
                 frames_skipped_mono_++;
             }
+            publish_cv_mono_.notify_one();
         }
 
         // --- Requeue buffer ---
