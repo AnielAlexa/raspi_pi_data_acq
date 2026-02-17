@@ -47,7 +47,7 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
         "/home/jetson/ros2_ws/src/raspi_pi_data_acq/camera_display_node/config/ae_tuning.txt");
     this->declare_parameter<std::string>("ae_ga_profile",
         "/home/jetson/ros2_ws/src/raspi_pi_data_acq/camera_display_node/config/ga_profile.txt");
-    this->declare_parameter<double>("ae_line_time_us", 13.67);
+    this->declare_parameter<double>("ae_line_time_us", 13.75);  // (1280+40)/96MHz
 
     rclcpp::QoS mono_qos(
     rclcpp::QoSInitialization(
@@ -61,7 +61,7 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     rclcpp::QoS imu_qos(
     rclcpp::QoSInitialization(
         RMW_QOS_POLICY_HISTORY_KEEP_LAST,
-        50
+        10
     )
     );
     imu_qos.reliable();
@@ -373,6 +373,16 @@ bool CameraDisplayNode::initV4L2() {
         RCLCPP_INFO(this->get_logger(), "Analogue gain set to %d", analogue_gain_);
     }
 
+    // Enable Tegra low-latency mode (bypasses ISP frame buffering)
+    constexpr uint32_t LOW_LATENCY_MODE_ID = 0x009a206d;
+    ctrl.id = LOW_LATENCY_MODE_ID;
+    ctrl.value = 1;
+    if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
+        RCLCPP_INFO(this->get_logger(), "low_latency_mode not available: %s", strerror(errno));
+    } else {
+        RCLCPP_INFO(this->get_logger(), "Tegra low_latency_mode enabled");
+    }
+
     // Start streaming
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (ioctl(v4l2_fd_, VIDIOC_STREAMON, &type) < 0) {
@@ -427,53 +437,30 @@ bool CameraDisplayNode::initV4L2() {
 // Enable Arducam Trigger Mode
 // ============================================================
 void CameraDisplayNode::enableTriggerMode() {
-    // Arducam JetVariety custom control IDs
-    // These are driver-specific; use v4l2-ctl --list-ctrls to find them
-    // Typical Arducam trigger_mode control ID
-    const uint32_t ARDUCAM_TRIGGER_MODE_ID = 0x009a2000;
-    const uint32_t ARDUCAM_FRAME_TIMEOUT_ID = 0x009a2004;
+    // Control IDs from v4l2-ctl --list-ctrls (OV9281 Arducam driver)
+    constexpr uint32_t TRIGGER_MODE_ID   = 0x00981901;
+    constexpr uint32_t FRAME_TIMEOUT_ID  = 0x00981903;
 
     struct v4l2_control ctrl;
 
     // Enable trigger mode
-    ctrl.id = ARDUCAM_TRIGGER_MODE_ID;
+    ctrl.id = TRIGGER_MODE_ID;
     ctrl.value = 1;
     if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
-        const int ioctl_errno = errno;
-        // Fallback: use v4l2-ctl command
-        std::string cmd = "v4l2-ctl -d /dev/video" + std::to_string(camera_index_) +
-                         " -c trigger_mode=1";
-        int ret = system(cmd.c_str());
-        if (ret != 0) {
-            RCLCPP_ERROR(this->get_logger(),
-                        "trigger_mode failed: ioctl(0x%08X, %s) and v4l2-ctl fallback (ret=%d)",
-                        ARDUCAM_TRIGGER_MODE_ID, strerror(ioctl_errno), ret);
-            return;
-        }
-        RCLCPP_INFO(this->get_logger(),
-                    "trigger_mode: ioctl unsupported (0x%08X, %s), fallback via v4l2-ctl succeeded",
-                    ARDUCAM_TRIGGER_MODE_ID, strerror(ioctl_errno));
-    } else {
-        RCLCPP_INFO(this->get_logger(), "Trigger mode enabled via ioctl");
+        RCLCPP_ERROR(this->get_logger(),
+                    "trigger_mode ioctl failed (0x%08X): %s",
+                    TRIGGER_MODE_ID, strerror(errno));
+        return;
     }
+    RCLCPP_INFO(this->get_logger(), "Trigger mode enabled via ioctl");
 
-    // Set frame timeout (ms) — how long to wait before reporting no frame
-    ctrl.id = ARDUCAM_FRAME_TIMEOUT_ID;
+    // Set frame timeout (ms)
+    ctrl.id = FRAME_TIMEOUT_ID;
     ctrl.value = 2000;
     if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
-        const int ioctl_errno = errno;
-        std::string cmd = "v4l2-ctl -d /dev/video" + std::to_string(camera_index_) +
-                         " -c frame_timeout=2000";
-        int ret = system(cmd.c_str());
-        if (ret != 0) {
-            RCLCPP_WARN(this->get_logger(),
-                       "frame_timeout failed: ioctl(0x%08X, %s) and v4l2-ctl fallback (ret=%d)",
-                       ARDUCAM_FRAME_TIMEOUT_ID, strerror(ioctl_errno), ret);
-        } else {
-            RCLCPP_INFO(this->get_logger(),
-                        "frame_timeout: ioctl unsupported (0x%08X, %s), fallback via v4l2-ctl succeeded",
-                        ARDUCAM_FRAME_TIMEOUT_ID, strerror(ioctl_errno));
-        }
+        RCLCPP_WARN(this->get_logger(),
+                   "frame_timeout ioctl failed (0x%08X): %s",
+                   FRAME_TIMEOUT_ID, strerror(errno));
     } else {
         RCLCPP_INFO(this->get_logger(), "Frame timeout set to 2000ms via ioctl");
     }
