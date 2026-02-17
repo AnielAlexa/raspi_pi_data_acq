@@ -31,12 +31,23 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     // Declare parameters
     camera_index_ = this->declare_parameter<int>("camera_index", 0);
     width_ = this->declare_parameter<int>("width", 1280);
-    height_ = this->declare_parameter<int>("height", 720);
+    height_ = this->declare_parameter<int>("height", 800);
     std::string serial_port = this->declare_parameter<std::string>("serial_port", "/dev/ttyTHS1");
     enable_pico_sync_ = this->declare_parameter<bool>("enable_pico_sync", true);
     exposure_ = this->declare_parameter<int>("exposure", 1200);
     analogue_gain_ = this->declare_parameter<int>("analogue_gain", 450);
     trigger_mode_enabled_ = this->declare_parameter<bool>("trigger_mode", true);
+
+    // Auto exposure parameters
+    this->declare_parameter<bool>("ae_enabled", true);
+    this->declare_parameter<std::string>("ae_method", "percentile");
+    this->declare_parameter<std::string>("ae_calib_dir",
+        "/home/jetson/ros2_ws/src/raspi_pi_data_acq/camera_display_node/config/calib/ov9281");
+    this->declare_parameter<std::string>("ae_tuning_file",
+        "/home/jetson/ros2_ws/src/raspi_pi_data_acq/camera_display_node/config/ae_tuning.txt");
+    this->declare_parameter<std::string>("ae_ga_profile",
+        "/home/jetson/ros2_ws/src/raspi_pi_data_acq/camera_display_node/config/ga_profile.txt");
+    this->declare_parameter<double>("ae_line_time_us", 13.67);
 
     rclcpp::QoS mono_qos(
     rclcpp::QoSInitialization(
@@ -170,6 +181,16 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     reusable_range_msg_.min_range = -500.0;
     reusable_range_msg_.max_range = 9000.0;
 
+    // Pre-allocate AE buffers (4x downsample)
+    ae_small_.create(height_ / 4, width_ / 4, CV_8UC1);
+    ae_pending_small_.create(height_ / 4, width_ / 4, CV_8UC1);
+
+    // Initialize auto exposure if enabled
+    bool ae_enabled = this->get_parameter("ae_enabled").as_bool();
+    if (ae_enabled) {
+        initAutoExposure();
+    }
+
     // Initialize Pico serial synchronization if enabled
     if (enable_pico_sync_) {
         initPicoSync(serial_port);
@@ -180,6 +201,15 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
 // Destructor
 // ============================================================
 CameraDisplayNode::~CameraDisplayNode() {
+    // Stop AE thread first (it depends on v4l2_fd_)
+    if (ae_running_.load()) {
+        ae_running_ = false;
+        ae_cv_.notify_one();
+        if (ae_thread_.joinable()) {
+            ae_thread_.join();
+        }
+    }
+
     // Stop capture thread
     if (capture_running_) {
         capture_running_ = false;
@@ -559,15 +589,33 @@ void CameraDisplayNode::captureThreadLoop() {
                 uint32_t matched = frames_matched_.load();
                 uint32_t received = frames_received_.load();
                 double match_rate = (received > 0) ? (100.0 * matched / received) : 0.0;
-                RCLCPP_INFO(this->get_logger(),
-                           "FPS: %.1f | Sync: %.0f%% | CB: %.0fµs [Conv:%.0f] | Mono: %.0fµs",
-                           smoothed_fps_, match_rate, callback_time_us_,
-                           convert_time_us_, publish_time_mono_us_);
+                if (ae_running_.load(std::memory_order_relaxed)) {
+                    RCLCPP_INFO(this->get_logger(),
+                               "FPS: %.1f | Sync: %.0f%% | CB: %.0fµs [Conv:%.0f] | Mono: %.0fµs | AE: %.1fms exp=%dus gain=%d",
+                               smoothed_fps_, match_rate, callback_time_us_,
+                               convert_time_us_, publish_time_mono_us_,
+                               ae_compute_time_us_ / 1000.0,
+                               current_exposure_us_.load(), current_gain_ctrl_.load());
+                } else {
+                    RCLCPP_INFO(this->get_logger(),
+                               "FPS: %.1f | Sync: %.0f%% | CB: %.0fµs [Conv:%.0f] | Mono: %.0fµs",
+                               smoothed_fps_, match_rate, callback_time_us_,
+                               convert_time_us_, publish_time_mono_us_);
+                }
             } else {
-                RCLCPP_INFO(this->get_logger(),
-                           "FPS: %.1f | CB: %.0fµs [Conv:%.0f] | Mono: %.0fµs",
-                           smoothed_fps_, callback_time_us_,
-                           convert_time_us_, publish_time_mono_us_);
+                if (ae_running_.load(std::memory_order_relaxed)) {
+                    RCLCPP_INFO(this->get_logger(),
+                               "FPS: %.1f | CB: %.0fµs [Conv:%.0f] | Mono: %.0fµs | AE: %.1fms exp=%dus gain=%d",
+                               smoothed_fps_, callback_time_us_,
+                               convert_time_us_, publish_time_mono_us_,
+                               ae_compute_time_us_ / 1000.0,
+                               current_exposure_us_.load(), current_gain_ctrl_.load());
+                } else {
+                    RCLCPP_INFO(this->get_logger(),
+                               "FPS: %.1f | CB: %.0fµs [Conv:%.0f] | Mono: %.0fµs",
+                               smoothed_fps_, callback_time_us_,
+                               convert_time_us_, publish_time_mono_us_);
+                }
             }
             frames_since_log_ = 0;
             last_log_time_ = now;
@@ -615,6 +663,18 @@ void CameraDisplayNode::captureThreadLoop() {
         auto convert_end = std::chrono::steady_clock::now();
         convert_time_us_ = std::chrono::duration<double>(convert_end - convert_start).count() * 1e6;
 
+        // --- AE frame handoff (4x downsample → AE thread) ---
+        if (ae_running_.load(std::memory_order_relaxed)) {
+            cv::Mat full_frame(height_, width_, CV_8UC1, reusable_msg_mono_.data.data());
+            cv::resize(full_frame, ae_small_, ae_small_.size(), 0, 0, cv::INTER_LINEAR);
+            {
+                std::lock_guard<std::mutex> lk(ae_mutex_);
+                std::swap(ae_pending_small_, ae_small_);
+                ae_frame_ready_ = true;
+            }
+            ae_cv_.notify_one();
+        }
+
         // --- Notify publisher ---
         {
             std::lock_guard<std::mutex> lock(publish_mutex_mono_);
@@ -644,6 +704,107 @@ void CameraDisplayNode::captureThreadLoop() {
             RCLCPP_DEBUG(this->get_logger(),
                         "Slow callback: %.1f µs (convert: %.1f µs)",
                         callback_time_us_, convert_time_us_);
+        }
+    }
+}
+
+// ============================================================
+// Auto Exposure Initialization
+// ============================================================
+void CameraDisplayNode::initAutoExposure() {
+    std::string ae_method = this->get_parameter("ae_method").as_string();
+    std::string ae_calib_dir = this->get_parameter("ae_calib_dir").as_string();
+    std::string ae_tuning_file = this->get_parameter("ae_tuning_file").as_string();
+    std::string ae_ga_profile = this->get_parameter("ae_ga_profile").as_string();
+    ae_line_time_us_ = this->get_parameter("ae_line_time_us").as_double();
+
+    camera_display_node::TuningParams tuning;
+    if (!ae_tuning_file.empty()) {
+        if (camera_display_node::loadTuningFile(ae_tuning_file, &tuning)) {
+            RCLCPP_INFO(this->get_logger(), "AE: Loaded tuning file: %s", ae_tuning_file.c_str());
+        } else {
+            RCLCPP_WARN(this->get_logger(), "AE: Could not load tuning file: %s, using defaults",
+                       ae_tuning_file.c_str());
+        }
+    }
+
+    ae_controller_ = std::make_unique<camera_display_node::AEController>();
+    if (!ae_controller_->init(ae_method, ae_calib_dir, ae_ga_profile, tuning)) {
+        RCLCPP_ERROR(this->get_logger(), "AE: Failed to initialize controller (method=%s)",
+                    ae_method.c_str());
+        ae_controller_.reset();
+        return;
+    }
+
+    // Seed current exposure/gain from node parameters (V4L2 lines → µs)
+    current_exposure_us_ = static_cast<int>(exposure_ * ae_line_time_us_);
+    current_gain_ctrl_ = analogue_gain_;
+
+    RCLCPP_INFO(this->get_logger(),
+               "AE: Initialized method=%s, line_time=%.2fµs, initial exp=%dus, gain=%d",
+               ae_method.c_str(), ae_line_time_us_,
+               current_exposure_us_.load(), current_gain_ctrl_.load());
+
+    ae_running_ = true;
+    ae_thread_ = std::thread(&CameraDisplayNode::aeThreadLoop, this);
+}
+
+// ============================================================
+// Auto Exposure Thread Loop
+// ============================================================
+void CameraDisplayNode::aeThreadLoop() {
+    cv::Mat local_frame;
+    local_frame.create(height_ / 4, width_ / 4, CV_8UC1);
+
+    while (ae_running_.load()) {
+        // Wait for a new frame
+        {
+            std::unique_lock<std::mutex> lk(ae_mutex_);
+            ae_cv_.wait(lk, [this] {
+                return ae_frame_ready_ || !ae_running_.load();
+            });
+            if (!ae_running_.load()) break;
+
+            // O(1) pointer swap
+            std::swap(local_frame, ae_pending_small_);
+            ae_frame_ready_ = false;
+        }
+
+        auto ae_start = std::chrono::steady_clock::now();
+
+        int cur_exp_us = current_exposure_us_.load();
+        int cur_gain_ctrl = current_gain_ctrl_.load();
+        float cur_gain_x = cur_gain_ctrl / 100.0f;
+
+        auto result = ae_controller_->compute(local_frame, cur_exp_us, cur_gain_x);
+
+        auto ae_end = std::chrono::steady_clock::now();
+        ae_compute_time_us_ = std::chrono::duration<double>(ae_end - ae_start).count() * 1e6;
+
+        if (result.changed && v4l2_fd_ >= 0) {
+            // Convert µs → exposure lines
+            int desired_lines = static_cast<int>(result.desired_exp_us / ae_line_time_us_);
+            int desired_gain_ctrl = static_cast<int>(std::round(result.desired_gain_x * 100.0f));
+
+            // Apply exposure via V4L2 ioctl
+            if (std::abs(desired_lines - static_cast<int>(cur_exp_us / ae_line_time_us_)) > 1) {
+                struct v4l2_control ctrl;
+                ctrl.id = V4L2_CID_EXPOSURE;
+                ctrl.value = desired_lines;
+                if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) == 0) {
+                    current_exposure_us_ = static_cast<int>(desired_lines * ae_line_time_us_);
+                }
+            }
+
+            // Apply gain if changed
+            if (desired_gain_ctrl != cur_gain_ctrl) {
+                struct v4l2_control ctrl;
+                ctrl.id = V4L2_CID_ANALOGUE_GAIN;
+                ctrl.value = desired_gain_ctrl;
+                if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) == 0) {
+                    current_gain_ctrl_ = desired_gain_ctrl;
+                }
+            }
         }
     }
 }

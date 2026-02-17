@@ -35,6 +35,11 @@ include_directories(include)
 add_executable(camera_display_node
   src/camera_display.cpp
   src/serial_sync.cpp
+  src/ae_controller.cpp
+  src/ae/auto_exposure_percentile.cpp
+  src/ae/auto_exposure_intensity.cpp
+  src/ae/auto_exp_utils.cpp
+  src/ae/photometric_model.cpp
 )
 
 # Create FPS subscriber executable
@@ -65,6 +70,11 @@ target_link_libraries(camera_fps_subscriber
 # Install executables
 install(TARGETS camera_display_node camera_fps_subscriber
   DESTINATION lib/${PROJECT_NAME}
+)
+
+# Install config files
+install(DIRECTORY config/
+  DESTINATION share/${PROJECT_NAME}/config
 )
 
 if(BUILD_TESTING)

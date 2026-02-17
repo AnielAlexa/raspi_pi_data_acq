@@ -39,6 +39,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include "camera_display_node/serial_sync.h"
+#include "camera_display_node/ae_controller.h"
 
 #include <array>
 #include <atomic>
@@ -171,6 +172,26 @@ private:
     double publish_time_mono_us_;
     std::atomic<uint32_t> slow_callbacks_;
     std::atomic<uint32_t> frames_skipped_mono_;
+
+    // ============================================================
+    // Auto Exposure Control
+    // ============================================================
+    void initAutoExposure();
+    void aeThreadLoop();
+
+    std::thread ae_thread_;
+    std::atomic<bool> ae_running_{false};
+    std::mutex ae_mutex_;
+    std::condition_variable ae_cv_;
+    bool ae_frame_ready_ = false;
+    cv::Mat ae_pending_small_;
+    cv::Mat ae_small_;
+
+    std::unique_ptr<camera_display_node::AEController> ae_controller_;
+    std::atomic<int> current_exposure_us_{0};
+    std::atomic<int> current_gain_ctrl_{0};
+    double ae_compute_time_us_ = 0.0;
+    double ae_line_time_us_ = 13.67;
 };
 
 #endif  // CAMERA_DISPLAY_NODE_CAMERA_DISPLAY_NODE_H
