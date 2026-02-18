@@ -454,16 +454,16 @@ void CameraDisplayNode::enableTriggerMode() {
     }
     RCLCPP_INFO(this->get_logger(), "Trigger mode enabled via ioctl");
 
-    // Set frame timeout (ms)
-    ctrl.id = FRAME_TIMEOUT_ID;
-    ctrl.value = 2000;
-    if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
-        RCLCPP_WARN(this->get_logger(),
-                   "frame_timeout ioctl failed (0x%08X): %s",
-                   FRAME_TIMEOUT_ID, strerror(errno));
-    } else {
-        RCLCPP_INFO(this->get_logger(), "Frame timeout set to 2000ms via ioctl");
-    }
+    // // Set frame timeout (ms)
+    // ctrl.id = FRAME_TIMEOUT_ID;
+    // ctrl.value = 2000;
+    // if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
+    //     RCLCPP_WARN(this->get_logger(),
+    //                "frame_timeout ioctl failed (0x%08X): %s",
+    //                FRAME_TIMEOUT_ID, strerror(errno));
+    // } else {
+    //     RCLCPP_INFO(this->get_logger(), "Frame timeout set to 2000ms via ioctl");
+    // }
 }
 
 // ============================================================

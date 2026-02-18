@@ -2,29 +2,18 @@
 # Used by: ./test_autoexposure_cpp <calib_dir> <method> <tuning_file>
 #
 # NOTE:
-# - This file now keeps only ACTIVE parameters used by current standalone logic.
-# - Exposure/gain update flow follows AutoCameraSettings.
+# compute() now mirrors uzh-rpg AutoCameraSettings::calculateNewSettings():
+#   1. Call AE method directly (no extra damping/step-limit/blending on top)
+#   2. Clamp to [min=20us, max_exposure_ms]
+#   3. adjustGain() heuristic
 
 # Hard upper limit for exposure time (ms).
-# 6000 us = 6 ms.
-max_exposure_ms = 6.8
+max_exposure_ms = 2.0
 
-# Gain bounds and step (same meaning as AutoCameraSettings options).
-# Repo-like defaults:
-#   min_gain=1.0, max_gain=4.0, gain_change_step=0.5
+# Gain bounds and step.
 min_gain_x = 1.0
-# 4.0x maps to gain control value 400 in this standalone app.
-max_gain_x = 4.0
+max_gain_x = 1.5
 gain_change_step_x = 0.5
-
-# Mean method: cap per-frame change (fraction of current exposure).
-mean_method_max_step_ratio = 0.12
-
-# Percentile method: additional damping and step/deadband limits.
-# Lower damping / smaller max step => more stable but slower adaptation.
-percentile_damping = 0.29
-percentile_max_step_ratio = 0.07
-percentile_deadband_us = 75
 
 # Hold gain for a few frames after each gain update to prevent ping-pong.
 gain_cooldown_frames = 7

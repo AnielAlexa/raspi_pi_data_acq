@@ -130,51 +130,26 @@ AEResult AEController::compute(const cv::Mat& small_gray,
     result.changed = false;
 
     const int last_exp_us = current_exp_us;
+    const int max_exp_us = static_cast<int>(std::round(tuning_.max_exposure_ms * 1000.0));
+    const int min_exp_us = 20;
 
-    // Run percentile controller (always, for internal state updates) if available
+    // --- Step 1: compute desired exposure (mirrors uzh-rpg calculateNewSettings) ---
     int desired_exp_us = last_exp_us;
-    if (percentile_ctrl_) {
+    if (method_ == "mean") {
+        desired_exp_us = intensity_ctrl_->computeDesiredExposureTimeIntensity(
+            small_gray, last_exp_us);
+    } else {
+        // percentile: the controller internally switches to intensity-based
+        // control when mean > use_intensity_high_bound (170), so no extra
+        // blending or damping is needed here — trust the controller output.
         desired_exp_us = percentile_ctrl_->computeDesiredExposureWeightedGradient(
             small_gray, last_exp_us, current_gain_x);
     }
 
-    if (method_ == "mean") {
-        desired_exp_us = intensity_ctrl_->computeDesiredExposureTimeIntensity(
-            small_gray, last_exp_us);
-        desired_exp_us = applyExposureStepLimit(
-            desired_exp_us, last_exp_us, tuning_.mean_method_max_step_ratio);
-    } else {
-        // Percentile method with bright-scene blending
-        const double mean_small = cv::mean(small_gray)[0];
-        if (mean_small > 170.0) {
-            const int intensity_us =
-                intensity_ctrl_->computeDesiredExposureTimeIntensity(
-                    small_gray, last_exp_us);
-            const double alpha = std::min(1.0, (mean_small - 170.0) / 40.0);
-            desired_exp_us = static_cast<int>(std::round(
-                (1.0 - alpha) * desired_exp_us + alpha * intensity_us));
-        }
+    // --- Step 2: clamp (mirrors uzh-rpg calculateNewSettings clamp block) ---
+    desired_exp_us = std::max(min_exp_us, std::min(desired_exp_us, max_exp_us));
 
-        // Damping
-        const double damp = tuning_.percentile_damping;
-        desired_exp_us = static_cast<int>(std::round(
-            last_exp_us + damp * (desired_exp_us - last_exp_us)));
-
-        // Step limit
-        desired_exp_us = applyExposureStepLimit(
-            desired_exp_us, last_exp_us, tuning_.percentile_max_step_ratio);
-
-        // Deadband
-        if (std::abs(desired_exp_us - last_exp_us) < tuning_.percentile_deadband_us) {
-            desired_exp_us = last_exp_us;
-        }
-    }
-
-    // Compute max exposure from tuning
-    const int max_exp_us = static_cast<int>(std::round(tuning_.max_exposure_ms * 1000.0));
-    const int min_exp_us = 20;
-
-    // Gain heuristic (matches AutoCameraSettings logic)
+    // --- Step 3: adjust gain (mirrors uzh-rpg adjustGain()) ---
     const int dec_gain_exp_us = static_cast<int>(0.2 * max_exp_us);
     const int inc_gain_exp_us = static_cast<int>(0.9 * max_exp_us);
 
@@ -197,7 +172,7 @@ AEResult AEController::compute(const cv::Mat& small_gray,
         }
     }
 
-    // Clamp exposure
+    // Final clamp after gain compensation
     desired_exp_us = std::max(min_exp_us, std::min(desired_exp_us, max_exp_us));
 
     // Update gain cooldown
