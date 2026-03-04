@@ -38,9 +38,9 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     height_ = this->declare_parameter<int>("height", 720);
     std::string serial_port = this->declare_parameter<std::string>("serial_port", "/dev/ttyTHS1");
     enable_pico_sync_ = this->declare_parameter<bool>("enable_pico_sync", true);
-    exposure_ = this->declare_parameter<int>("exposure", 1200);
+    exposure_ = this->declare_parameter<int>("exposure", 12);
     analogue_gain_ = this->declare_parameter<int>("analogue_gain", 100);
-    trigger_mode_enabled_ = this->declare_parameter<bool>("trigger_mode", true);
+    trigger_mode_enabled_ = this->declare_parameter<bool>("trigger_mode", false);
 
     rclcpp::QoS mono_qos(
     rclcpp::QoSInitialization(
@@ -181,7 +181,7 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
 
     // Auto-exposure P-controller
     std::string ae_default_path = ament_index_cpp::get_package_share_directory("camera_display_node")
-                                  + "/config/auto_exposure.conf";
+                                  + "/config/auto_exposure.yaml";
     std::string ae_config_path = this->declare_parameter<std::string>("ae_config_path", ae_default_path);
     loadAEConfig(ae_config_path);
     current_exposure_.store(exposure_);
@@ -189,7 +189,7 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     if (ae_enabled_) {
         ae_running_ = true;
         ae_thread_ = std::thread(&CameraDisplayNode::autoExposureThreadLoop, this);
-        RCLCPP_INFO(this->get_logger(), "Auto-exposure enabled: target=%.0f, Kp=%.2f, range=[%d,%d]",
+        RCLCPP_INFO(this->get_logger(), "Auto-exposure enabled: target=%.0f, Kp=%.4f, range=[%d,%d]",
                     ae_target_mean_, ae_kp_, ae_min_exposure_, ae_max_exposure_);
     }
 }
@@ -891,22 +891,25 @@ bool CameraDisplayNode::loadAEConfig(const std::string& path) {
         return false;
     }
 
+    auto trim = [](std::string& s) {
+        s.erase(0, s.find_first_not_of(" \t\r\n"));
+        s.erase(s.find_last_not_of(" \t\r\n") + 1);
+    };
+
     std::string line;
     while (std::getline(file, line)) {
         // Skip comments and empty lines
         if (line.empty() || line[0] == '#') continue;
 
-        auto eq = line.find('=');
-        if (eq == std::string::npos) continue;
+        // Support both YAML "key: value" and legacy "key=value"
+        auto sep = line.find(':');
+        if (sep == std::string::npos) {
+            sep = line.find('=');
+            if (sep == std::string::npos) continue;
+        }
 
-        std::string key = line.substr(0, eq);
-        std::string val = line.substr(eq + 1);
-
-        // Trim whitespace
-        auto trim = [](std::string& s) {
-            s.erase(0, s.find_first_not_of(" \t\r\n"));
-            s.erase(s.find_last_not_of(" \t\r\n") + 1);
-        };
+        std::string key = line.substr(0, sep);
+        std::string val = line.substr(sep + 1);
         trim(key);
         trim(val);
 

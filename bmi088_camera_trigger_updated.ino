@@ -5,6 +5,7 @@
 //   - ISR optimization (no slow SPI in interrupts)
 //   - Cached timestamps per loop iteration
 //   - Direct serial writes (single core, no queuing overhead)
+//   - Non-blocking Hardware Auto-Exposure via UART (Jetson -> Pico)
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -32,7 +33,6 @@ constexpr uint8_t PIN_BMP_INT = 14;
 
 // Camera trigger
 constexpr uint8_t PIN_CAMERA_TRIGGER = 22;
-constexpr uint32_t CAMERA_TRIGGER_PULSE_US = 100;
 constexpr uint32_t CAMERA_PERIOD_MS = 50;  // 20 Hz
 
 constexpr float SEALEVEL_HPA = 1013.25f;
@@ -111,9 +111,14 @@ float bmpTemperature, bmpPressure, bmpAltitude;
 float altitudeBaselineM = 0.0f;
 bool baselineReady = false;
 
-// Camera tracking
+// Camera tracking & Auto-Exposure
 uint16_t frameCounter = 0;
 uint32_t cameraPulseStartUs = 0;
+uint32_t currentExposureUs = 8; // Starts at 8us, updated by Jetson
+
+// Serial receive buffer
+char rxBuffer[16];
+uint8_t rxIndex = 0;
 
 // Sensor objects
 Bmi088 bmi(SPI, PIN_CS_ACCEL, PIN_CS_GYRO);
@@ -143,7 +148,7 @@ void bmpInterruptHandler() {
 }
 
 // Hardware timer callback for camera
-bool cameraTimerCallback(struct repeating_timer *t) {
+bool cameraTimerCallback(struct repeating_timer* t) {
   cameraTriggerReady = true;
   return true;
 }
@@ -167,18 +172,18 @@ void setup() {
 
   // Serial init
   Serial1.begin(230400);
-  
+
   // SPI0 init
   pinMode(PIN_CS_ACCEL, OUTPUT);
   pinMode(PIN_CS_GYRO, OUTPUT);
   digitalWrite(PIN_CS_ACCEL, HIGH);
   digitalWrite(PIN_CS_GYRO, HIGH);
-  
+
   SPI.setRX(PIN_SPI_MISO);
   SPI.setTX(PIN_SPI_MOSI);
   SPI.setSCK(PIN_SPI_SCK);
   SPI.begin();
-  
+
   // BMI088 init
   int status = bmi.begin();
   if (status > 0) {
@@ -203,7 +208,7 @@ void setup() {
   } else {
     failBlinkForever();
   }
-  
+
   // I2C0 init (BMP388)
   Wire.setSDA(PIN_BMP_SDA);
   Wire.setSCL(PIN_BMP_SCL);
@@ -214,7 +219,7 @@ void setup() {
       failBlinkForever();
     }
   }
-  
+
   bmp388.setClock(400000);
   bmp388.setPresOversampling(OVERSAMPLING_X8);
   bmp388.setTempOversampling(OVERSAMPLING_X2);
@@ -249,18 +254,42 @@ void loop() {
   // Cache timestamp at loop start for consistency
   uint32_t loopMicros = micros();
 
-  // --- Handle camera trigger pulse end ---
+  // --- 1. Non-Blocking Serial Command Listener (Auto-Exposure from Jetson) ---
+  while (Serial1.available() > 0) {
+    char c = Serial1.read();
+    if (c == '\n') {
+      rxBuffer[rxIndex] = '\0'; // Null-terminate the string
+      
+      // Parse command: e.g., "E250" means set exposure to 250 us
+      if (rxBuffer[0] == 'E') {
+        long newExp = atol(&rxBuffer[1]);
+        // Clamp exposure to a max of 48ms (48000 us) so it doesn't overrun the 50ms frame timer
+        // and a min of 1 us
+        if (newExp > 0 && newExp <= 4000) { 
+          currentExposureUs = (uint32_t)newExp;
+        }
+      }
+      rxIndex = 0; // Reset buffer index for the next incoming command
+      
+    } else if (c != '\r' && rxIndex < sizeof(rxBuffer) - 1) {
+      // Ignore carriage returns (\r), store actual characters
+      rxBuffer[rxIndex++] = c;
+    }
+  }
+
+  // --- 2. Handle camera trigger pulse end ---
+  // Using the dynamically updated currentExposureUs instead of a constant
   if (cameraPulseStartUs != 0) {
-    if ((loopMicros - cameraPulseStartUs) >= CAMERA_TRIGGER_PULSE_US) {
+    if ((loopMicros - cameraPulseStartUs) >= currentExposureUs) {
       digitalWrite(PIN_CAMERA_TRIGGER, LOW);
       cameraPulseStartUs = 0;
     }
   }
 
-  // --- BMI088: Hardware interrupt at 400 Hz ---
+  // --- 3. BMI088: Hardware interrupt at 400 Hz ---
   if (imuDataReady) {
     imuDataReady = false;
-    
+
     // Read sensor in main loop (not in ISR for better timing)
     bmi.readSensor();
     uint32_t imuTs = loopMicros;
@@ -279,13 +308,13 @@ void loop() {
     Serial1.write((uint8_t*)&pkt, sizeof(ImuPacket));
   }
 
-  // --- Camera trigger: Hardware timer at 20 Hz ---
+  // --- 4. Camera trigger: Hardware timer at 20 Hz ---
   if (cameraTriggerReady) {
     cameraTriggerReady = false;
-    
+
     frameCounter++;
     uint32_t trigTs = loopMicros;
-    
+
     digitalWrite(PIN_CAMERA_TRIGGER, HIGH);
     cameraPulseStartUs = trigTs;
 
@@ -299,7 +328,7 @@ void loop() {
     Serial1.write((uint8_t*)&tpkt, sizeof(TriggerPacket));
   }
 
-  // --- BMP388: Interrupt at ~10-12.5 Hz ---
+  // --- 5. BMP388: Interrupt at ~10-12.5 Hz ---
   if (bmpDataReady && baselineReady) {
     bmpDataReady = false;
     uint32_t altTs = loopMicros;
@@ -312,7 +341,7 @@ void loop() {
     apkt.timestamp_us = (uint64_t)altTs;
     apkt.altitude_m = relAltM;
     apkt.crc16 = crc16_fast((uint8_t*)&apkt, sizeof(AltimeterPacket) - 2);
-    
+
     Serial1.write((uint8_t*)&apkt, sizeof(AltimeterPacket));
   }
 }
