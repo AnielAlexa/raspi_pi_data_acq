@@ -3,5 +3,5 @@
 enabled: true
 target_mean: 120
 kp: 0.007
-min_exposure: 4
-max_exposure: 201
+min_exposure: 2
+max_exposure: 2

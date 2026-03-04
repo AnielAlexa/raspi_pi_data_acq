@@ -40,7 +40,7 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     enable_pico_sync_ = this->declare_parameter<bool>("enable_pico_sync", true);
     exposure_ = this->declare_parameter<int>("exposure", 12);
     analogue_gain_ = this->declare_parameter<int>("analogue_gain", 100);
-    trigger_mode_enabled_ = this->declare_parameter<bool>("trigger_mode", false);
+    trigger_mode_enabled_ = this->declare_parameter<bool>("trigger_mode", true);
 
     rclcpp::QoS mono_qos(
     rclcpp::QoSInitialization(
