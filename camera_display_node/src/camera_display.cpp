@@ -40,6 +40,7 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     enable_pico_sync_ = this->declare_parameter<bool>("enable_pico_sync", true);
     exposure_ = this->declare_parameter<int>("exposure", 12);
     analogue_gain_ = this->declare_parameter<int>("analogue_gain", 100);
+    frame_rate_ = this->declare_parameter<int>("frame_rate", 21);
     trigger_mode_enabled_ = this->declare_parameter<bool>("trigger_mode", true);
 
     rclcpp::QoS mono_qos(
@@ -413,6 +414,20 @@ bool CameraDisplayNode::initV4L2() {
     if (trigger_mode_enabled_) {
         usleep(1000000);  // 1s settle time before switching to trigger mode
         enableTriggerMode();
+    }
+
+    // Set frame rate after trigger mode (Arducam user control 0x00981906, min=5 max=80 step=1)
+    {
+        struct v4l2_control ctrl;
+        memset(&ctrl, 0, sizeof(ctrl));
+        ctrl.id    = 0x00981906;
+        ctrl.value = frame_rate_;
+        if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
+            RCLCPP_WARN(this->get_logger(), "Failed to set frame_rate=%d: %s",
+                       frame_rate_, strerror(errno));
+        } else {
+            RCLCPP_INFO(this->get_logger(), "Frame rate set to %d fps", frame_rate_);
+        }
     }
 
     return true;
