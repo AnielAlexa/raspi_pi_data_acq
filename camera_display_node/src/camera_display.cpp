@@ -190,8 +190,8 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     if (ae_enabled_) {
         ae_running_ = true;
         ae_thread_ = std::thread(&CameraDisplayNode::autoExposureThreadLoop, this);
-        RCLCPP_INFO(this->get_logger(), "Auto-exposure enabled: target=%.0f, Kp=%.4f, range=[%d,%d]",
-                    ae_target_mean_, ae_kp_, ae_min_exposure_, ae_max_exposure_);
+        RCLCPP_INFO(this->get_logger(), "Auto-exposure enabled: target=%.0f, Kp=%.4f, deadband=±%.1f, range=[%d,%d]",
+                    ae_target_mean_, ae_kp_, ae_deadband_, ae_min_exposure_, ae_max_exposure_);
     }
 }
 
@@ -931,6 +931,7 @@ bool CameraDisplayNode::loadAEConfig(const std::string& path) {
         if (key == "enabled") ae_enabled_ = (val == "true" || val == "1");
         else if (key == "target_mean") ae_target_mean_ = std::stod(val);
         else if (key == "kp") ae_kp_ = std::stod(val);
+        else if (key == "deadband") ae_deadband_ = std::stod(val);
         else if (key == "min_exposure") ae_min_exposure_ = std::stoi(val);
         else if (key == "max_exposure") ae_max_exposure_ = std::stoi(val);
     }
@@ -943,6 +944,9 @@ bool CameraDisplayNode::loadAEConfig(const std::string& path) {
 // Auto-Exposure Thread Loop (P-Controller)
 // ============================================================
 void CameraDisplayNode::autoExposureThreadLoop() {
+    // Seed accumulator from the initial exposure so we don't start from 0
+    ae_exposure_acc_ = static_cast<double>(current_exposure_.load());
+
     while (ae_running_) {
         std::unique_lock<std::mutex> lock(ae_mutex_);
         ae_cv_.wait(lock, [this] { return ae_frame_ready_ || !ae_running_; });
@@ -953,8 +957,15 @@ void CameraDisplayNode::autoExposureThreadLoop() {
         lock.unlock();
 
         double error = ae_target_mean_ - mean;
-        double new_exp = static_cast<double>(current_exposure_.load()) + ae_kp_ * error;
-        int clamped = std::clamp(static_cast<int>(new_exp), ae_min_exposure_, ae_max_exposure_);
+
+        // Deadband: ignore small errors to prevent chatter around setpoint
+        if (std::abs(error) <= ae_deadband_) continue;
+
+        ae_exposure_acc_ += ae_kp_ * error;
+        ae_exposure_acc_ = std::clamp(ae_exposure_acc_,
+                                      static_cast<double>(ae_min_exposure_),
+                                      static_cast<double>(ae_max_exposure_));
+        int clamped = static_cast<int>(std::round(ae_exposure_acc_));
         current_exposure_.store(clamped);
 
         struct v4l2_control ctrl{};

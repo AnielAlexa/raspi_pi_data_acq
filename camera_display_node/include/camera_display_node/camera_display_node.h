@@ -196,12 +196,14 @@ private:
     bool ae_enabled_ = false;
     double ae_target_mean_ = 120.0;
     double ae_kp_ = 0.5;
+    double ae_deadband_ = 3.0;  // |error| <= deadband → no update (prevents steady-state chatter)
     int ae_min_exposure_ = 1;
     int ae_max_exposure_ = 65523;
 
     // Shared state
     double ae_current_mean_ = 0.0;
     std::atomic<int> current_exposure_{700};
+    double ae_exposure_acc_ = 0.0;  // float accumulator — prevents sub-integer step loss
 };
 
 #endif  // CAMERA_DISPLAY_NODE_CAMERA_DISPLAY_NODE_H
