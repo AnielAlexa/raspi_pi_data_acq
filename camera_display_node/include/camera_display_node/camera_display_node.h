@@ -20,6 +20,11 @@
  *   - Stores timestamps in trigger_map
  *   - Publishes IMU data immediately
  *
+ * Thread 4 (auto-exposure): autoExposureThreadLoop()
+ *   - Waits on condition variable (zero CPU when idle)
+ *   - Woken by capture thread after computing frame mean
+ *   - P-controller adjusts V4L2 exposure via ioctl
+ *
  * SYNCHRONIZATION:
  * - IMU-camera sync preserved: timestamps captured in Thread 1 before async publish
  * - Thread coordination: condition variable for event-driven notification
@@ -46,6 +51,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -73,6 +79,10 @@ private:
 
     // Publisher thread
     void publisherThreadLoopMono();
+
+    // Auto-exposure
+    void autoExposureThreadLoop();
+    bool loadAEConfig(const std::string& path);
 
     // Utilities
     rclcpp::Time getFrameTimestamp(uint16_t frame_id);
@@ -171,6 +181,26 @@ private:
     double publish_time_mono_us_;
     std::atomic<uint32_t> slow_callbacks_;
     std::atomic<uint32_t> frames_skipped_mono_;
+
+    // ============================================================
+    // Auto-Exposure P-Controller
+    // ============================================================
+    std::thread ae_thread_;
+    std::mutex ae_mutex_;
+    std::condition_variable ae_cv_;
+    bool ae_frame_ready_ = false;
+    std::atomic<bool> ae_running_{false};
+
+    // AE config (loaded from file)
+    bool ae_enabled_ = false;
+    double ae_target_mean_ = 120.0;
+    double ae_kp_ = 0.5;
+    int ae_min_exposure_ = 1;
+    int ae_max_exposure_ = 65523;
+
+    // Shared state
+    double ae_current_mean_ = 0.0;
+    std::atomic<int> current_exposure_{700};
 };
 
 #endif  // CAMERA_DISPLAY_NODE_CAMERA_DISPLAY_NODE_H

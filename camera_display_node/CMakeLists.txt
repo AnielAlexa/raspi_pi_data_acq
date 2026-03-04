@@ -22,6 +22,7 @@ endif()
 
 # Find dependencies
 find_package(ament_cmake REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
@@ -44,6 +45,7 @@ add_executable(camera_fps_subscriber
 
 # Link dependencies
 ament_target_dependencies(camera_display_node
+  ament_index_cpp
   rclcpp
   sensor_msgs
 )
@@ -65,6 +67,11 @@ target_link_libraries(camera_fps_subscriber
 # Install executables
 install(TARGETS camera_display_node camera_fps_subscriber
   DESTINATION lib/${PROJECT_NAME}
+)
+
+# Install config files
+install(DIRECTORY config/
+  DESTINATION share/${PROJECT_NAME}/config
 )
 
 if(BUILD_TESTING)

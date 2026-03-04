@@ -10,9 +10,13 @@
 #include <sys/mman.h>
 #include <sys/select.h>
 #include <unistd.h>
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 
+#include <ament_index_cpp/get_package_share_directory.hpp>
 #include <rclcpp/executors/multi_threaded_executor.hpp>
 
 // ============================================================
@@ -35,7 +39,7 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     std::string serial_port = this->declare_parameter<std::string>("serial_port", "/dev/ttyTHS1");
     enable_pico_sync_ = this->declare_parameter<bool>("enable_pico_sync", true);
     exposure_ = this->declare_parameter<int>("exposure", 1200);
-    analogue_gain_ = this->declare_parameter<int>("analogue_gain", 450);
+    analogue_gain_ = this->declare_parameter<int>("analogue_gain", 100);
     trigger_mode_enabled_ = this->declare_parameter<bool>("trigger_mode", true);
 
     rclcpp::QoS mono_qos(
@@ -174,12 +178,33 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     if (enable_pico_sync_) {
         initPicoSync(serial_port);
     }
+
+    // Auto-exposure P-controller
+    std::string ae_default_path = ament_index_cpp::get_package_share_directory("camera_display_node")
+                                  + "/config/auto_exposure.conf";
+    std::string ae_config_path = this->declare_parameter<std::string>("ae_config_path", ae_default_path);
+    loadAEConfig(ae_config_path);
+    current_exposure_.store(exposure_);
+
+    if (ae_enabled_) {
+        ae_running_ = true;
+        ae_thread_ = std::thread(&CameraDisplayNode::autoExposureThreadLoop, this);
+        RCLCPP_INFO(this->get_logger(), "Auto-exposure enabled: target=%.0f, Kp=%.2f, range=[%d,%d]",
+                    ae_target_mean_, ae_kp_, ae_min_exposure_, ae_max_exposure_);
+    }
 }
 
 // ============================================================
 // Destructor
 // ============================================================
 CameraDisplayNode::~CameraDisplayNode() {
+    // Stop auto-exposure thread
+    if (ae_running_) {
+        ae_running_ = false;
+        ae_cv_.notify_one();
+        if (ae_thread_.joinable()) ae_thread_.join();
+    }
+
     // Stop capture thread
     if (capture_running_) {
         capture_running_ = false;
@@ -397,55 +422,46 @@ bool CameraDisplayNode::initV4L2() {
 // Enable Arducam Trigger Mode
 // ============================================================
 void CameraDisplayNode::enableTriggerMode() {
-    // Arducam JetVariety custom control IDs
-    // These are driver-specific; use v4l2-ctl --list-ctrls to find them
-    // Typical Arducam trigger_mode control ID
-    const uint32_t ARDUCAM_TRIGGER_MODE_ID = 0x009a2000;
-    const uint32_t ARDUCAM_FRAME_TIMEOUT_ID = 0x009a2004;
+    // Control IDs from: v4l2-ctl -d /dev/video0 -l
+    // User Controls (0x0098xxxx)
+    static constexpr uint32_t ARDUCAM_TRIGGER_MODE_ID        = 0x00981901;  // trigger_mode bool
+    static constexpr uint32_t ARDUCAM_DISABLE_FRAME_TIMEOUT  = 0x00981902;  // disable_frame_timeout bool
+    static constexpr uint32_t ARDUCAM_FRAME_TIMEOUT_ID       = 0x00981903;  // frame_timeout int (ms, 100–12000)
 
     struct v4l2_control ctrl;
 
     // Enable trigger mode
-    ctrl.id = ARDUCAM_TRIGGER_MODE_ID;
+    memset(&ctrl, 0, sizeof(ctrl));
+    ctrl.id    = ARDUCAM_TRIGGER_MODE_ID;
     ctrl.value = 1;
     if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
-        const int ioctl_errno = errno;
-        // Fallback: use v4l2-ctl command
-        std::string cmd = "v4l2-ctl -d /dev/video" + std::to_string(camera_index_) +
-                         " -c trigger_mode=1";
-        int ret = system(cmd.c_str());
-        if (ret != 0) {
-            RCLCPP_ERROR(this->get_logger(),
-                        "trigger_mode failed: ioctl(0x%08X, %s) and v4l2-ctl fallback (ret=%d)",
-                        ARDUCAM_TRIGGER_MODE_ID, strerror(ioctl_errno), ret);
-            return;
-        }
-        RCLCPP_INFO(this->get_logger(),
-                    "trigger_mode: ioctl unsupported (0x%08X, %s), fallback via v4l2-ctl succeeded",
-                    ARDUCAM_TRIGGER_MODE_ID, strerror(ioctl_errno));
-    } else {
-        RCLCPP_INFO(this->get_logger(), "Trigger mode enabled via ioctl");
+        RCLCPP_ERROR(this->get_logger(),
+                     "Failed to enable trigger_mode (0x%08X): %s",
+                     ARDUCAM_TRIGGER_MODE_ID, strerror(errno));
+        return;
+    }
+    RCLCPP_INFO(this->get_logger(), "Trigger mode enabled");
+
+    // Keep frame-timeout active (do NOT set disable_frame_timeout)
+    memset(&ctrl, 0, sizeof(ctrl));
+    ctrl.id    = ARDUCAM_DISABLE_FRAME_TIMEOUT;
+    ctrl.value = 0;
+    if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
+        RCLCPP_WARN(this->get_logger(),
+                    "Could not clear disable_frame_timeout (0x%08X): %s",
+                    ARDUCAM_DISABLE_FRAME_TIMEOUT, strerror(errno));
     }
 
-    // Set frame timeout (ms) — how long to wait before reporting no frame
-    ctrl.id = ARDUCAM_FRAME_TIMEOUT_ID;
+    // Set frame timeout (ms) — how long driver waits before reporting no frame
+    memset(&ctrl, 0, sizeof(ctrl));
+    ctrl.id    = ARDUCAM_FRAME_TIMEOUT_ID;
     ctrl.value = 2000;
     if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
-        const int ioctl_errno = errno;
-        std::string cmd = "v4l2-ctl -d /dev/video" + std::to_string(camera_index_) +
-                         " -c frame_timeout=2000";
-        int ret = system(cmd.c_str());
-        if (ret != 0) {
-            RCLCPP_WARN(this->get_logger(),
-                       "frame_timeout failed: ioctl(0x%08X, %s) and v4l2-ctl fallback (ret=%d)",
-                       ARDUCAM_FRAME_TIMEOUT_ID, strerror(ioctl_errno), ret);
-        } else {
-            RCLCPP_INFO(this->get_logger(),
-                        "frame_timeout: ioctl unsupported (0x%08X, %s), fallback via v4l2-ctl succeeded",
-                        ARDUCAM_FRAME_TIMEOUT_ID, strerror(ioctl_errno));
-        }
+        RCLCPP_WARN(this->get_logger(),
+                    "Failed to set frame_timeout (0x%08X): %s",
+                    ARDUCAM_FRAME_TIMEOUT_ID, strerror(errno));
     } else {
-        RCLCPP_INFO(this->get_logger(), "Frame timeout set to 2000ms via ioctl");
+        RCLCPP_INFO(this->get_logger(), "Frame timeout set to 2000 ms");
     }
 }
 
@@ -559,15 +575,30 @@ void CameraDisplayNode::captureThreadLoop() {
                 uint32_t matched = frames_matched_.load();
                 uint32_t received = frames_received_.load();
                 double match_rate = (received > 0) ? (100.0 * matched / received) : 0.0;
-                RCLCPP_INFO(this->get_logger(),
-                           "FPS: %.1f | Sync: %.0f%% | CB: %.0fµs [Conv:%.0f] | Mono: %.0fµs",
-                           smoothed_fps_, match_rate, callback_time_us_,
-                           convert_time_us_, publish_time_mono_us_);
+                if (ae_enabled_) {
+                    RCLCPP_INFO(this->get_logger(),
+                               "FPS: %.1f | Mean: %.0f Exp: %d | Sync: %.0f%% | CB: %.0fµs [Conv:%.0f] | Mono: %.0fµs",
+                               smoothed_fps_, ae_current_mean_, current_exposure_.load(),
+                               match_rate, callback_time_us_,
+                               convert_time_us_, publish_time_mono_us_);
+                } else {
+                    RCLCPP_INFO(this->get_logger(),
+                               "FPS: %.1f | Sync: %.0f%% | CB: %.0fµs [Conv:%.0f] | Mono: %.0fµs",
+                               smoothed_fps_, match_rate, callback_time_us_,
+                               convert_time_us_, publish_time_mono_us_);
+                }
             } else {
-                RCLCPP_INFO(this->get_logger(),
-                           "FPS: %.1f | CB: %.0fµs [Conv:%.0f] | Mono: %.0fµs",
-                           smoothed_fps_, callback_time_us_,
-                           convert_time_us_, publish_time_mono_us_);
+                if (ae_enabled_) {
+                    RCLCPP_INFO(this->get_logger(),
+                               "FPS: %.1f | Mean: %.0f Exp: %d | CB: %.0fµs [Conv:%.0f] | Mono: %.0fµs",
+                               smoothed_fps_, ae_current_mean_, current_exposure_.load(),
+                               callback_time_us_, convert_time_us_, publish_time_mono_us_);
+                } else {
+                    RCLCPP_INFO(this->get_logger(),
+                               "FPS: %.1f | CB: %.0fµs [Conv:%.0f] | Mono: %.0fµs",
+                               smoothed_fps_, callback_time_us_,
+                               convert_time_us_, publish_time_mono_us_);
+                }
             }
             frames_since_log_ = 0;
             last_log_time_ = now;
@@ -614,6 +645,20 @@ void CameraDisplayNode::captureThreadLoop() {
 
         auto convert_end = std::chrono::steady_clock::now();
         convert_time_us_ = std::chrono::duration<double>(convert_end - convert_start).count() * 1e6;
+
+        // --- Compute frame mean for auto-exposure (data already in CPU cache) ---
+        if (ae_enabled_) {
+            const uint8_t* pixels = reusable_msg_mono_.data.data();
+            const size_t n = reusable_msg_mono_.data.size();
+            uint64_t sum = 0;
+            for (size_t i = 0; i < n; ++i) sum += pixels[i];
+            double mean = static_cast<double>(sum) / static_cast<double>(n);
+
+            std::lock_guard<std::mutex> ae_lock(ae_mutex_);
+            ae_current_mean_ = mean;
+            ae_frame_ready_ = true;
+            ae_cv_.notify_one();
+        }
 
         // --- Notify publisher ---
         {
@@ -831,6 +876,75 @@ void CameraDisplayNode::publisherThreadLoopMono() {
             image_pub_mono_->publish(local_msg);
             publish_time_mono_us_ = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - publish_start).count() * 1e6;
+        }
+    }
+}
+
+// ============================================================
+// Auto-Exposure Config Loader
+// ============================================================
+bool CameraDisplayNode::loadAEConfig(const std::string& path) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        RCLCPP_WARN(this->get_logger(), "AE config not found: %s — auto-exposure disabled", path.c_str());
+        ae_enabled_ = false;
+        return false;
+    }
+
+    std::string line;
+    while (std::getline(file, line)) {
+        // Skip comments and empty lines
+        if (line.empty() || line[0] == '#') continue;
+
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+
+        std::string key = line.substr(0, eq);
+        std::string val = line.substr(eq + 1);
+
+        // Trim whitespace
+        auto trim = [](std::string& s) {
+            s.erase(0, s.find_first_not_of(" \t\r\n"));
+            s.erase(s.find_last_not_of(" \t\r\n") + 1);
+        };
+        trim(key);
+        trim(val);
+
+        if (key == "enabled") ae_enabled_ = (val == "true" || val == "1");
+        else if (key == "target_mean") ae_target_mean_ = std::stod(val);
+        else if (key == "kp") ae_kp_ = std::stod(val);
+        else if (key == "min_exposure") ae_min_exposure_ = std::stoi(val);
+        else if (key == "max_exposure") ae_max_exposure_ = std::stoi(val);
+    }
+
+    RCLCPP_INFO(this->get_logger(), "AE config loaded from %s", path.c_str());
+    return true;
+}
+
+// ============================================================
+// Auto-Exposure Thread Loop (P-Controller)
+// ============================================================
+void CameraDisplayNode::autoExposureThreadLoop() {
+    while (ae_running_) {
+        std::unique_lock<std::mutex> lock(ae_mutex_);
+        ae_cv_.wait(lock, [this] { return ae_frame_ready_ || !ae_running_; });
+        if (!ae_running_) break;
+
+        double mean = ae_current_mean_;
+        ae_frame_ready_ = false;
+        lock.unlock();
+
+        double error = ae_target_mean_ - mean;
+        double new_exp = static_cast<double>(current_exposure_.load()) + ae_kp_ * error;
+        int clamped = std::clamp(static_cast<int>(new_exp), ae_min_exposure_, ae_max_exposure_);
+        current_exposure_.store(clamped);
+
+        struct v4l2_control ctrl{};
+        ctrl.id = V4L2_CID_EXPOSURE;
+        ctrl.value = clamped;
+        if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                 "AE: ioctl set exposure failed: %s", strerror(errno));
         }
     }
 }
