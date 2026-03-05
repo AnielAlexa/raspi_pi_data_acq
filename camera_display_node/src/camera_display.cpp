@@ -38,9 +38,8 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     height_ = this->declare_parameter<int>("height", 720);
     std::string serial_port = this->declare_parameter<std::string>("serial_port", "/dev/ttyTHS1");
     enable_pico_sync_ = this->declare_parameter<bool>("enable_pico_sync", true);
-    exposure_ = this->declare_parameter<int>("exposure", 12);
-    analogue_gain_ = this->declare_parameter<int>("analogue_gain", 100);
-    frame_rate_ = this->declare_parameter<int>("frame_rate", 21);
+    exposure_ = this->declare_parameter<int>("exposure", 20);  // range 1-65523, driver default=681
+    frame_rate_ = this->declare_parameter<int>("frame_rate", 22);
     trigger_mode_enabled_ = this->declare_parameter<bool>("trigger_mode", true);
 
     rclcpp::QoS mono_qos(
@@ -352,21 +351,12 @@ bool CameraDisplayNode::initV4L2() {
     struct v4l2_control ctrl;
 
     ctrl.id = V4L2_CID_EXPOSURE;
-    ctrl.value = exposure_;
+    ctrl.value = 130;//std::max(1, std::min(50000, exposure_));
     if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
         RCLCPP_WARN(this->get_logger(), "Failed to set exposure=%d: %s",
                    exposure_, strerror(errno));
     } else {
-        RCLCPP_INFO(this->get_logger(), "Exposure set to %d", exposure_);
-    }
-
-    ctrl.id = V4L2_CID_ANALOGUE_GAIN;
-    ctrl.value = analogue_gain_;
-    if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
-        RCLCPP_WARN(this->get_logger(), "Failed to set analogue_gain=%d: %s",
-                   analogue_gain_, strerror(errno));
-    } else {
-        RCLCPP_INFO(this->get_logger(), "Analogue gain set to %d", analogue_gain_);
+        RCLCPP_INFO(this->get_logger(), "Exposure set to %d ", exposure_);
     }
 
     // Start streaming

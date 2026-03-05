@@ -139,7 +139,6 @@ private:
 
     // Parameters
     int exposure_;
-    int analogue_gain_;
     int frame_rate_;
     bool trigger_mode_enabled_;
 

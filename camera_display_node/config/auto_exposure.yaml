@@ -1,8 +1,8 @@
 # Auto-exposure P-controller configuration
 # Edit values and restart the node to apply (no rebuild needed).
 enabled: true
-target_mean: 128
+target_mean: 129
 kp: 0.09
 deadband: 3.0
 min_exposure: 1
-max_exposure: 3000
+max_exposure: 4111
