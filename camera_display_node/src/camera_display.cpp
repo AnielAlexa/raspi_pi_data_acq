@@ -924,10 +924,50 @@ bool CameraDisplayNode::loadAEConfig(const std::string& path) {
         else if (key == "deadband") ae_deadband_ = std::stod(val);
         else if (key == "min_exposure") ae_min_exposure_ = std::stoi(val);
         else if (key == "max_exposure") ae_max_exposure_ = std::stoi(val);
+        else if (key == "afps_enabled") afps_enabled_ = (val == "true" || val == "1");
+        else if (key.size() > 7 && key.substr(0, 7) == "bracket") {
+            // Parse bracket_N_max and bracket_N_fps
+            auto sep2 = key.rfind('_');
+            if (sep2 != std::string::npos && sep2 > 7) {
+                std::string field = key.substr(sep2 + 1);        // "max" or "fps"
+                std::string mid   = key.substr(7, sep2 - 7);     // "_N"
+                if (mid.size() >= 2 && mid[0] == '_') {
+                    int idx = std::stoi(mid.substr(1));
+                    if (idx >= static_cast<int>(afps_brackets_.size()))
+                        afps_brackets_.resize(idx + 1, {0, 0});
+                    if (field == "max") afps_brackets_[idx].max_exp = std::stoi(val);
+                    else if (field == "fps") afps_brackets_[idx].fps = std::stoi(val);
+                }
+            }
+        }
     }
 
+    // Sort brackets ascending by max_exp (safety guard against file ordering)
+    std::sort(afps_brackets_.begin(), afps_brackets_.end(),
+              [](const AfpsBracket & a, const AfpsBracket & b) { return a.max_exp < b.max_exp; });
+
     RCLCPP_INFO(this->get_logger(), "AE config loaded from %s", path.c_str());
+    if (!afps_brackets_.empty())
+        RCLCPP_INFO(this->get_logger(), "AFPS: %zu brackets loaded, enabled=%s",
+                    afps_brackets_.size(), afps_enabled_ ? "true" : "false");
     return true;
+}
+
+// ============================================================
+// Adaptive Frame Rate: Apply new frame rate via Arducam ioctl
+// ============================================================
+void CameraDisplayNode::setFrameRate(int fps) {
+    struct v4l2_control ctrl{};
+    ctrl.id    = 0x00981906;
+    ctrl.value = fps;
+    if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                             "AFPS: set frame_rate=%d failed: %s", fps, strerror(errno));
+    } else {
+        RCLCPP_INFO(this->get_logger(), "AFPS: frame_rate → %d fps (exposure=%d)",
+                    fps, current_exposure_.load());
+    }
+    afps_active_fps_ = fps;
 }
 
 // ============================================================
@@ -964,6 +1004,17 @@ void CameraDisplayNode::autoExposureThreadLoop() {
         if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                                  "AE: ioctl set exposure failed: %s", strerror(errno));
+        }
+
+        // Adaptive frame rate: pick first bracket whose max_exp >= new exposure
+        if (afps_enabled_ && !afps_brackets_.empty()) {
+            int target_fps = afps_brackets_.back().fps;
+            for (const auto & b : afps_brackets_) {
+                if (clamped <= b.max_exp) { target_fps = b.fps; break; }
+            }
+            if (target_fps != afps_active_fps_) {
+                setFrameRate(target_fps);
+            }
         }
     }
 }

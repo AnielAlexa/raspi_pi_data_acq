@@ -1,8 +1,20 @@
 # Auto-exposure P-controller configuration
 # Edit values and restart the node to apply (no rebuild needed).
 enabled: true
-target_mean: 129
-kp: 0.09
+target_mean: 110
+kp: 0.3
 deadband: 3.0
 min_exposure: 1
 max_exposure: 4111
+
+# Adaptive frame rate brackets
+# Frame rate is adjusted based on current exposure (V4L2 units ≈ µs).
+# Brackets are checked ascending; first bracket whose max_exp >= current_exposure wins.
+# Must be sorted ascending by max_exp. Edit and restart to apply.
+afps_enabled: true
+bracket_0_max: 100
+bracket_0_fps: 21
+bracket_1_max: 250
+bracket_1_fps: 22
+bracket_2_max: 5000
+bracket_2_fps: 80

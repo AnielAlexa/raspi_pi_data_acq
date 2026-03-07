@@ -84,6 +84,9 @@ private:
     void autoExposureThreadLoop();
     bool loadAEConfig(const std::string& path);
 
+    // Adaptive frame rate
+    void setFrameRate(int fps);
+
     // Utilities
     rclcpp::Time getFrameTimestamp(uint16_t frame_id);
     void logSyncStats();
@@ -203,6 +206,15 @@ private:
     double ae_current_mean_ = 0.0;
     std::atomic<int> current_exposure_{700};
     double ae_exposure_acc_ = 0.0;  // float accumulator — prevents sub-integer step loss
+
+    // ============================================================
+    // Adaptive Frame Rate
+    // ============================================================
+    struct AfpsBracket { int max_exp; int fps; };
+
+    bool afps_enabled_ = false;
+    std::vector<AfpsBracket> afps_brackets_;
+    int afps_active_fps_ = -1;  // -1 = not yet set; avoids redundant ioctl
 };
 
 #endif  // CAMERA_DISPLAY_NODE_CAMERA_DISPLAY_NODE_H
