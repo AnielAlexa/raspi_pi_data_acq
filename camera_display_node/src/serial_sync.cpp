@@ -25,8 +25,7 @@ SerialSync::SerialSync(rclcpp::Node* node,
       imu_callback_(imu_cb),
       trigger_callback_(trigger_cb),
       altimeter_callback_(altimeter_cb),
-      time_offset_initialized_(false),
-      time_offset_ns_(0)
+      time_offset_initialized_(false)
 {
     offset_samples_.reserve(TIME_OFFSET_SAMPLES);
 }
@@ -137,14 +136,14 @@ int64_t SerialSync::calculate_median(std::vector<int64_t>& samples)
     }
 }
 
-rclcpp::Time SerialSync::pico_to_ros_time(uint32_t pico_us) const
+rclcpp::Time SerialSync::pico_to_ros_time(uint64_t pico_us) const
 {
     int64_t pico_ns = static_cast<int64_t>(pico_us) * 1000LL;
-    int64_t ros_ns = pico_ns + time_offset_ns_;
+    int64_t ros_ns = pico_ns + time_offset_ns_.load(std::memory_order_relaxed);
     return rclcpp::Time(ros_ns);
 }
 
-void SerialSync::initialize_time_offset(uint32_t pico_us)
+void SerialSync::initialize_time_offset(uint64_t pico_us)
 {
     if (time_offset_initialized_.load()) {
         return;
@@ -166,7 +165,9 @@ void SerialSync::initialize_time_offset(uint32_t pico_us)
 
     // Once we have enough samples, calculate median
     if (offset_samples_.size() >= TIME_OFFSET_SAMPLES) {
-        time_offset_ns_ = calculate_median(offset_samples_);
+        int64_t median_offset = calculate_median(offset_samples_);
+        time_offset_ns_.store(median_offset, std::memory_order_relaxed);
+        initial_offset_ns_ = median_offset;
 
         // Calculate statistics
         int64_t min_offset = *std::min_element(offset_samples_.begin(), offset_samples_.end());
@@ -174,13 +175,37 @@ void SerialSync::initialize_time_offset(uint32_t pico_us)
         int64_t range = max_offset - min_offset;
 
         RCLCPP_INFO(node_->get_logger(), "Time offset calibration complete:");
-        RCLCPP_INFO(node_->get_logger(), "  Median offset: %.3f ms", time_offset_ns_ / 1e6);
+        RCLCPP_INFO(node_->get_logger(), "  Median offset: %.3f ms", median_offset / 1e6);
         RCLCPP_INFO(node_->get_logger(), "  Sample range: %.3f ms", range / 1e6);
 
         // Set flag and clear samples
         time_offset_initialized_.store(true);
         offset_samples_.clear();
         offset_samples_.shrink_to_fit();
+    }
+}
+
+void SerialSync::update_time_offset(uint64_t pico_us)
+{
+    int64_t sample = node_->now().nanoseconds()
+                   - static_cast<int64_t>(pico_us) * 1000LL;
+    int64_t current = time_offset_ns_.load(std::memory_order_relaxed);
+    int64_t residual = sample - current;
+
+    // Reject outliers caused by OS scheduling jitter or serial bursts
+    if (residual > DRIFT_OUTLIER_NS || residual < -DRIFT_OUTLIER_NS) {
+        return;
+    }
+
+    // EMA update — written only by the serial thread, so no CAS needed
+    time_offset_ns_.store(current + static_cast<int64_t>(DRIFT_EMA_ALPHA * residual),
+                          std::memory_order_relaxed);
+
+    // Log accumulated drift every ~10 seconds (4000 IMU samples at 400 Hz)
+    if (++drift_update_count_ % 4000 == 0) {
+        double drift_ms = static_cast<double>(
+            time_offset_ns_.load(std::memory_order_relaxed) - initial_offset_ns_) / 1e6;
+        RCLCPP_DEBUG(node_->get_logger(), "Pico clock drift: %.3f ms from init", drift_ms);
     }
 }
 
@@ -199,6 +224,9 @@ void SerialSync::process_imu_packet(const ImuPacket& pkt)
     if (!time_offset_initialized_.load()) {
         return;
     }
+
+    // Continuous drift compensation using IMU packets (400Hz, most regular source)
+    update_time_offset(pkt.timestamp_us);
 
     // Call IMU callback
     imu_callback_(pkt.timestamp_us, pkt.ax, pkt.ay, pkt.az, pkt.gx, pkt.gy, pkt.gz);

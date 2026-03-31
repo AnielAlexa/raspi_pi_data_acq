@@ -106,6 +106,10 @@ volatile bool imuDataReady = false;
 volatile bool bmpDataReady = false;
 volatile bool cameraTriggerReady = false;
 
+// IMU timestamp captured at the DRDY edge (ISR) — most accurate possible.
+// uint64_t: never rolls over (time_us_64 wraps at ~584,000 years).
+volatile uint64_t imuTimestampUs = 0;
+
 // Sensor data storage
 float bmpTemperature, bmpPressure, bmpAltitude;
 float altitudeBaselineM = 0.0f;
@@ -113,7 +117,7 @@ bool baselineReady = false;
 
 // Camera tracking & Auto-Exposure
 uint16_t frameCounter = 0;
-uint32_t cameraPulseStartUs = 0;
+uint64_t cameraPulseStartUs = 0;
 uint32_t currentExposureUs = 8; // Starts at 8us, updated by Jetson
 
 // Serial receive buffer
@@ -140,6 +144,7 @@ uint16_t crc16_fast(const uint8_t* data, size_t len) {
 
 // Interrupt handlers (keep minimal - no SPI/I2C!)
 void imuInterruptHandler() {
+  imuTimestampUs = time_us_64();  // 64-bit: no 71-min rollover; hw register read, ISR-safe
   imuDataReady = true;
 }
 
@@ -170,7 +175,8 @@ void setup() {
   pinMode(PIN_CAMERA_TRIGGER, OUTPUT);
   digitalWrite(PIN_CAMERA_TRIGGER, LOW);
 
-  // Serial init
+  // Serial init — large TX ring buffer to avoid blocking the loop
+  Serial1.setFIFOSize(256);
   Serial1.begin(230400);
 
   // SPI0 init
@@ -251,8 +257,8 @@ void setup() {
 // ======================== MAIN LOOP ========================
 
 void loop() {
-  // Cache timestamp at loop start for consistency
-  uint32_t loopMicros = micros();
+  // Cache timestamp at loop start for consistency (64-bit: no 71-min rollover)
+  uint64_t loopMicros = time_us_64();
 
   // --- 1. Non-Blocking Serial Command Listener (Auto-Exposure from Jetson) ---
   while (Serial1.available() > 0) {
@@ -286,17 +292,42 @@ void loop() {
     }
   }
 
-  // --- 3. BMI088: Hardware interrupt at 400 Hz ---
-  if (imuDataReady) {
-    imuDataReady = false;
+  // --- 3. Camera trigger: Hardware timer at 20 Hz ---
+  // Runs before IMU so the GPIO edge is not delayed by SPI reads or serial TX.
+  if (cameraTriggerReady) {
+    cameraTriggerReady = false;
 
-    // Read sensor in main loop (not in ISR for better timing)
+    frameCounter++;
+
+    // Assert GPIO first, then capture time_us_64() — timestamp is within ~1µs of edge.
+    digitalWrite(PIN_CAMERA_TRIGGER, HIGH);
+    uint64_t trigTs = time_us_64();
+    cameraPulseStartUs = trigTs;
+
+    TriggerPacket tpkt;
+    tpkt.header = 0xBB66;
+    tpkt.timestamp_us = trigTs;
+    tpkt.frame_id = frameCounter;
+    tpkt.reserved = 0;
+    tpkt.crc16 = crc16_fast((uint8_t*)&tpkt, sizeof(TriggerPacket) - 2);
+
+    Serial1.write((uint8_t*)&tpkt, sizeof(TriggerPacket));
+  }
+
+  // --- 4. BMI088: Hardware interrupt at 400 Hz ---
+  if (imuDataReady) {
+    // Read timestamp before clearing the flag — prevents ISR from overwriting
+    // imuTimestampUs between the flag clear and the read (Cortex-M0+ has no atomics).
+    noInterrupts();
+    uint64_t imuTs = imuTimestampUs;
+    imuDataReady = false;
+    interrupts();
+
     bmi.readSensor();
-    uint32_t imuTs = loopMicros;
 
     ImuPacket pkt;
     pkt.header = 0xAA55;
-    pkt.timestamp_us = (uint64_t)imuTs;
+    pkt.timestamp_us = imuTs;
     pkt.ax = bmi.getAccelX_mss();
     pkt.ay = bmi.getAccelY_mss();
     pkt.az = bmi.getAccelZ_mss();
@@ -308,37 +339,16 @@ void loop() {
     Serial1.write((uint8_t*)&pkt, sizeof(ImuPacket));
   }
 
-  // --- 4. Camera trigger: Hardware timer at 20 Hz ---
-  if (cameraTriggerReady) {
-    cameraTriggerReady = false;
-
-    frameCounter++;
-    uint32_t trigTs = loopMicros;
-
-    digitalWrite(PIN_CAMERA_TRIGGER, HIGH);
-    cameraPulseStartUs = trigTs;
-
-    TriggerPacket tpkt;
-    tpkt.header = 0xBB66;
-    tpkt.timestamp_us = (uint64_t)trigTs;
-    tpkt.frame_id = frameCounter;
-    tpkt.reserved = 0;
-    tpkt.crc16 = crc16_fast((uint8_t*)&tpkt, sizeof(TriggerPacket) - 2);
-
-    Serial1.write((uint8_t*)&tpkt, sizeof(TriggerPacket));
-  }
-
   // --- 5. BMP388: Interrupt at ~10-12.5 Hz ---
   if (bmpDataReady && baselineReady) {
     bmpDataReady = false;
-    uint32_t altTs = loopMicros;
 
     bmp388.getMeasurements(bmpTemperature, bmpPressure, bmpAltitude);
     float relAltM = bmpAltitude - altitudeBaselineM;
 
     AltimeterPacket apkt;
     apkt.header = 0xCC77;
-    apkt.timestamp_us = (uint64_t)altTs;
+    apkt.timestamp_us = loopMicros;
     apkt.altitude_m = relAltM;
     apkt.crc16 = crc16_fast((uint8_t*)&apkt, sizeof(AltimeterPacket) - 2);
 

@@ -72,10 +72,10 @@ private:
     void cleanupV4L2();
 
     // Callbacks
-    void onImuPacket(uint32_t timestamp_us, float ax, float ay, float az,
+    void onImuPacket(uint64_t timestamp_us, float ax, float ay, float az,
                      float gx, float gy, float gz);
-    void onTriggerPacket(uint32_t timestamp_us, uint16_t frame_id);
-    void onAltimeterPacket(uint32_t timestamp_us, float altitude_m);
+    void onTriggerPacket(uint64_t timestamp_us, uint16_t frame_id);
+    void onAltimeterPacket(uint64_t timestamp_us, float altitude_m);
 
     // Publisher thread
     void publisherThreadLoopMono();
@@ -140,6 +140,11 @@ private:
     std::atomic<bool> sequence_calibrated_{false};
     int32_t sequence_to_frame_id_offset_ = 0;
 
+    // Calibration validation: confirm offset is correct over first N frames
+    uint32_t calibration_validation_frames_{0};
+    uint32_t calibration_validation_hits_{0};
+    static constexpr uint32_t CALIBRATION_VALIDATION_COUNT = 40;
+
     // Parameters
     int exposure_;
     int frame_rate_;
@@ -168,6 +173,10 @@ private:
     // Altimeter baseline (zero-reset on first sample)
     std::atomic<bool> altitude_baseline_set_;
     float altitude_baseline_m_;
+
+    // V4L2 sequence tracking for accurate frame drop detection
+    uint32_t last_v4l2_sequence_{0};
+    bool last_v4l2_sequence_valid_{false};
 
     // ============================================================
     // Synchronization Statistics

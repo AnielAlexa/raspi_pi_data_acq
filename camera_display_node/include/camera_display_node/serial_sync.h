@@ -56,9 +56,9 @@ constexpr size_t TIME_OFFSET_SAMPLES = 100;
 
 class SerialSync {
 public:
-    using ImuCallback = std::function<void(uint32_t timestamp_us, float ax, float ay, float az, float gx, float gy, float gz)>;
-    using TriggerCallback = std::function<void(uint32_t timestamp_us, uint16_t frame_id)>;
-    using AltimeterCallback = std::function<void(uint32_t timestamp_us, float altitude_m)>;
+    using ImuCallback = std::function<void(uint64_t timestamp_us, float ax, float ay, float az, float gx, float gy, float gz)>;
+    using TriggerCallback = std::function<void(uint64_t timestamp_us, uint16_t frame_id)>;
+    using AltimeterCallback = std::function<void(uint64_t timestamp_us, float altitude_m)>;
 
     SerialSync(rclcpp::Node* node,
                const std::string& port,
@@ -70,7 +70,7 @@ public:
     void start();
     void stop();
 
-    rclcpp::Time pico_to_ros_time(uint32_t pico_us) const;
+    rclcpp::Time pico_to_ros_time(uint64_t pico_us) const;
     bool is_calibrated() const { return time_offset_initialized_.load(); }
 
 private:
@@ -79,7 +79,8 @@ private:
     void process_imu_packet(const ImuPacket& pkt);
     void process_trigger_packet(const TriggerPacket& pkt);
     void process_altimeter_packet(const AltimeterPacket& pkt);
-    void initialize_time_offset(uint32_t pico_us);
+    void initialize_time_offset(uint64_t pico_us);
+    void update_time_offset(uint64_t pico_us);
     uint16_t calculate_crc16(const uint8_t* data, size_t len);
     int64_t calculate_median(std::vector<int64_t>& samples);
 
@@ -95,7 +96,11 @@ private:
     AltimeterCallback altimeter_callback_;
 
     std::atomic<bool> time_offset_initialized_;
-    int64_t time_offset_ns_;
+    std::atomic<int64_t> time_offset_ns_{0};  // written by serial thread, read by capture thread
+    int64_t initial_offset_ns_{0};            // for drift logging
+    uint64_t drift_update_count_{0};
+    static constexpr double DRIFT_EMA_ALPHA = 0.002;       // ~500-sample window (~1.25s at 400Hz)
+    static constexpr int64_t DRIFT_OUTLIER_NS = 5000000LL; // 5ms — reject OS scheduling jitter
     std::vector<int64_t> offset_samples_;
 };
 

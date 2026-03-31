@@ -502,13 +502,16 @@ void CameraDisplayNode::captureThreadLoop() {
         FD_ZERO(&fds);
         FD_SET(v4l2_fd_, &fds);
 
-        // Block indefinitely to stay fully event-driven (no polling/timeout)
-        int ret = select(v4l2_fd_ + 1, &fds, nullptr, nullptr, nullptr);
+        // 200ms timeout lets the capture thread check capture_running_ on shutdown
+        // without burning CPU — a blocked select() would delay join() up to one frame period.
+        struct timeval tv { 0, 200000 };
+        int ret = select(v4l2_fd_ + 1, &fds, nullptr, nullptr, &tv);
         if (ret < 0) {
             if (errno == EINTR) continue;
             RCLCPP_ERROR(this->get_logger(), "select() failed: %s", strerror(errno));
             break;
         }
+        if (ret == 0) continue;  // timeout — loop back to check capture_running_
 
         auto callback_start = std::chrono::steady_clock::now();
 
@@ -535,6 +538,8 @@ void CameraDisplayNode::captureThreadLoop() {
                     // Pico has sent at least one trigger — calibrate
                     sequence_to_frame_id_offset_ = static_cast<int32_t>(expected) - static_cast<int32_t>(buf.sequence);
                     sequence_calibrated_ = true;
+                    calibration_validation_frames_ = 0;
+                    calibration_validation_hits_ = 0;
                     RCLCPP_INFO(this->get_logger(),
                                "Sequence calibrated: V4L2 seq=%u → frame_id=%u (offset=%d)",
                                buf.sequence, expected, sequence_to_frame_id_offset_);
@@ -545,21 +550,20 @@ void CameraDisplayNode::captureThreadLoop() {
             frame_id = static_cast<uint16_t>(buf.sequence & 0xFFFF);
         }
 
-        // --- Frame drop detection ---
-        if (enable_pico_sync_ && expected_frame_id_ > 0 && sequence_calibrated_.load()) {
-            uint16_t expected = expected_frame_id_ + 1;
-            if (frame_id != expected) {
-                if ((frame_id > expected) || (frame_id == 0 && expected == 0xFFFF)) {
-                    uint16_t drop_count = (frame_id > expected) ?
-                                         (frame_id - expected) :
-                                         (0xFFFF - expected + frame_id + 1);
-                    frame_drops_ += drop_count;
-                    RCLCPP_DEBUG(this->get_logger(),
-                               "Frame drop: expected %u, got %u (dropped %u)",
-                               expected, frame_id, drop_count);
-                }
+        // --- Frame drop detection (via V4L2 sequence gaps) ---
+        // Use buf.sequence directly — it skips monotonically when V4L2 drops a frame,
+        // which leaves the frame_id mapping intact (both sides skip the same frame).
+        if (last_v4l2_sequence_valid_) {
+            uint32_t gap = buf.sequence - last_v4l2_sequence_;
+            if (gap > 1) {
+                frame_drops_ += gap - 1;
+                RCLCPP_WARN(this->get_logger(),
+                           "V4L2 frame drop: seq %u→%u (%u dropped)",
+                           last_v4l2_sequence_, buf.sequence, gap - 1);
             }
         }
+        last_v4l2_sequence_ = buf.sequence;
+        last_v4l2_sequence_valid_ = true;
 
         // --- FPS Calculation ---
         auto now = std::chrono::steady_clock::now();
@@ -613,11 +617,39 @@ void CameraDisplayNode::captureThreadLoop() {
         rclcpp::Time frame_timestamp;
         if (enable_pico_sync_) {
             rclcpp::Time frame_time = getFrameTimestamp(frame_id);
-            if (frame_time.nanoseconds() > 0) {
+            bool hit = (frame_time.nanoseconds() > 0);
+            if (hit) {
                 frame_timestamp = frame_time;
                 frames_matched_++;
             } else {
                 frame_timestamp = this->now();
+            }
+
+            // Calibration validation: if the offset is wrong by ±1, we'll miss consistently.
+            // After CALIBRATION_VALIDATION_COUNT frames, if hit rate < 80% adjust by -1 and retry.
+            if (sequence_calibrated_.load() &&
+                calibration_validation_frames_ < CALIBRATION_VALIDATION_COUNT)
+            {
+                calibration_validation_frames_++;
+                if (hit) calibration_validation_hits_++;
+
+                if (calibration_validation_frames_ == CALIBRATION_VALIDATION_COUNT) {
+                    double hit_rate = static_cast<double>(calibration_validation_hits_) /
+                                     CALIBRATION_VALIDATION_COUNT;
+                    if (hit_rate < 0.80) {
+                        // Offset is likely off by 1 — decrement and recalibrate
+                        sequence_to_frame_id_offset_--;
+                        calibration_validation_frames_ = 0;
+                        calibration_validation_hits_ = 0;
+                        RCLCPP_WARN(this->get_logger(),
+                                   "Calibration hit rate %.0f%% < 80%% — adjusting offset to %d",
+                                   hit_rate * 100.0, sequence_to_frame_id_offset_);
+                    } else {
+                        RCLCPP_INFO(this->get_logger(),
+                                   "Calibration validated: %.0f%% hit rate over %u frames",
+                                   hit_rate * 100.0, CALIBRATION_VALIDATION_COUNT);
+                    }
+                }
             }
         } else {
             frame_timestamp = this->now();
@@ -733,7 +765,7 @@ void CameraDisplayNode::initPicoSync(const std::string& serial_port) {
 // ============================================================
 // IMU Packet Callback
 // ============================================================
-void CameraDisplayNode::onImuPacket(uint32_t timestamp_us, float ax, float ay, float az,
+void CameraDisplayNode::onImuPacket(uint64_t timestamp_us, float ax, float ay, float az,
                                      float gx, float gy, float gz) {
     if (!serial_sync_ || !imu_pub_) return;
 
@@ -753,7 +785,7 @@ void CameraDisplayNode::onImuPacket(uint32_t timestamp_us, float ax, float ay, f
 // ============================================================
 // Altimeter Packet Callback
 // ============================================================
-void CameraDisplayNode::onAltimeterPacket(uint32_t timestamp_us, float altitude_m) {
+void CameraDisplayNode::onAltimeterPacket(uint64_t timestamp_us, float altitude_m) {
     if (!serial_sync_ || !range_pub_) return;
 
     if (!altitude_baseline_set_.load()) {
@@ -773,15 +805,11 @@ void CameraDisplayNode::onAltimeterPacket(uint32_t timestamp_us, float altitude_
 // ============================================================
 // Trigger Packet Callback
 // ============================================================
-void CameraDisplayNode::onTriggerPacket(uint32_t timestamp_us, uint16_t frame_id) {
+void CameraDisplayNode::onTriggerPacket(uint64_t timestamp_us, uint16_t frame_id) {
     if (!serial_sync_) return;
 
-    rclcpp::Time trigger_time;
-    if (serial_sync_->is_calibrated()) {
-        trigger_time = serial_sync_->pico_to_ros_time(timestamp_us);
-    } else {
-        trigger_time = this->now();
-    }
+    // serial_sync only dispatches trigger callbacks after calibration, so timestamp is always valid
+    rclcpp::Time trigger_time = serial_sync_->pico_to_ros_time(timestamp_us);
 
     {
         std::lock_guard<std::mutex> lock(trigger_map_mutex_);
