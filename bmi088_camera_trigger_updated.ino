@@ -176,7 +176,8 @@ void setup() {
   digitalWrite(PIN_CAMERA_TRIGGER, LOW);
 
   // Serial init — large TX ring buffer to avoid blocking the loop
-  Serial1.setFIFOSize(256);
+  // 2048 bytes @ 14.4 KB/sec = ~142 ms of buffering, enough to survive Jetson scheduling jitter
+  Serial1.setFIFOSize(2048);
   Serial1.begin(230400);
 
   // SPI0 init

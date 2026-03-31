@@ -74,6 +74,13 @@ install(DIRECTORY config/
   DESTINATION share/${PROJECT_NAME}/config
 )
 
+# Re-apply CAP_SYS_NICE after each build so RT thread priorities work without sudo.
+# Requires a NOPASSWD sudoers entry for setcap — see repo CLAUDE.md for setup instructions.
+add_custom_command(TARGET camera_display_node POST_BUILD
+    COMMAND sudo -n setcap cap_sys_nice+eip $<TARGET_FILE:camera_display_node>
+    COMMENT "Setting cap_sys_nice on camera_display_node binary"
+)
+
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()

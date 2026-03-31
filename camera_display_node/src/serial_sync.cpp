@@ -6,6 +6,7 @@
 #include "camera_display_node/serial_sync.h"
 
 #include <fcntl.h>
+#include <pthread.h>
 #include <termios.h>
 #include <unistd.h>
 #include <cstring>
@@ -47,6 +48,19 @@ void SerialSync::start()
 
     running_ = true;
     serial_thread_ = std::thread(&SerialSync::serial_read_loop, this);
+
+    // Elevate to RT to prevent starvation that causes Pico TX FIFO overflow and IMU drops
+    sched_param sp{};
+    sp.sched_priority = 47;
+    int rt_ret = pthread_setschedparam(serial_thread_.native_handle(), SCHED_FIFO, &sp);
+    if (rt_ret != 0) {
+        RCLCPP_WARN(node_->get_logger(),
+            "Failed to set serial thread RT priority (need CAP_SYS_NICE or run as root): %s",
+            strerror(rt_ret));
+    } else {
+        RCLCPP_INFO(node_->get_logger(), "Serial thread set to SCHED_FIFO priority 47");
+    }
+
     RCLCPP_INFO(node_->get_logger(), "Serial reader started on %s @ %d baud",
                 port_.c_str(), SERIAL_BAUDRATE);
 }
@@ -343,9 +357,13 @@ void SerialSync::serial_read_loop()
                 }
             }
 
-            // Prevent buffer overflow
-            if (buffer.size() > 512) {
-                buffer.erase(buffer.begin(), buffer.end() - 256);
+            // Prevent buffer overflow — threshold is generous (4096) because the serial
+            // thread runs at RT priority; hitting this indicates a real stall, not jitter.
+            if (buffer.size() > 4096) {
+                RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+                    "Serial RX buffer overflow (%zu bytes) — dropping oldest data",
+                    buffer.size());
+                buffer.erase(buffer.begin(), buffer.end() - 512);
             }
 
             // Stats every second (only after calibration)
