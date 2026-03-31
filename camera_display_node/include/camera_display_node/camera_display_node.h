@@ -51,6 +51,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -79,6 +80,9 @@ private:
 
     // Publisher thread
     void publisherThreadLoopMono();
+
+    // IMU publish thread
+    void imuPublishThreadLoop();
 
     // Auto-exposure
     void autoExposureThreadLoop();
@@ -110,6 +114,13 @@ private:
     bool frame_ready_to_publish_mono_;
     std::atomic<bool> publisher_running_mono_;
     sensor_msgs::msg::Image pending_msg_mono_;
+
+    // IMU publish thread (decoupled from serial thread)
+    std::thread imu_publish_thread_;
+    std::atomic<bool> imu_publish_running_{false};
+    std::mutex imu_queue_mutex_;
+    std::condition_variable imu_queue_cv_;
+    std::queue<sensor_msgs::msg::Imu> imu_queue_;
 
     // ============================================================
     // Camera Configuration

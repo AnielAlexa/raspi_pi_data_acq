@@ -57,7 +57,7 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
         50
     )
     );
-    imu_qos.reliable();
+    imu_qos.best_effort();
     imu_qos.durability_volatile();
 
     rclcpp::QoS range_qos(
@@ -174,6 +174,27 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     reusable_range_msg_.min_range = -500.0;
     reusable_range_msg_.max_range = 9000.0;
 
+    // Start IMU publish thread (decoupled from serial thread)
+    imu_publish_running_ = true;
+    imu_publish_thread_ = std::thread(&CameraDisplayNode::imuPublishThreadLoop, this);
+
+    struct sched_param imu_pub_param;
+    imu_pub_param.sched_priority = 46;
+    int imu_pub_ret = pthread_setschedparam(imu_publish_thread_.native_handle(), SCHED_FIFO, &imu_pub_param);
+    if (imu_pub_ret != 0) {
+        if (imu_pub_ret == EPERM || imu_pub_ret == EACCES) {
+            RCLCPP_INFO(this->get_logger(),
+                       "IMU publisher RT priority not applied (%s). Continuing with normal scheduler.",
+                       strerror(imu_pub_ret));
+        } else {
+            RCLCPP_WARN(this->get_logger(),
+                       "Failed to set RT priority on IMU publisher thread: %s",
+                       strerror(imu_pub_ret));
+        }
+    } else {
+        RCLCPP_INFO(this->get_logger(), "IMU publisher thread set to SCHED_FIFO priority 46");
+    }
+
     // Initialize Pico serial synchronization if enabled
     if (enable_pico_sync_) {
         initPicoSync(serial_port);
@@ -224,6 +245,15 @@ CameraDisplayNode::~CameraDisplayNode() {
         publish_cv_mono_.notify_one();
         if (publisher_thread_mono_.joinable()) {
             publisher_thread_mono_.join();
+        }
+    }
+
+    // Stop IMU publish thread before stopping serial (which feeds the queue)
+    if (imu_publish_running_) {
+        imu_publish_running_ = false;
+        imu_queue_cv_.notify_one();
+        if (imu_publish_thread_.joinable()) {
+            imu_publish_thread_.join();
         }
     }
 
@@ -769,17 +799,46 @@ void CameraDisplayNode::onImuPacket(uint64_t timestamp_us, float ax, float ay, f
                                      float gx, float gy, float gz) {
     if (!serial_sync_ || !imu_pub_) return;
 
-    reusable_imu_msg_.header.stamp = serial_sync_->pico_to_ros_time(timestamp_us);
+    sensor_msgs::msg::Imu msg = reusable_imu_msg_;
+    msg.header.stamp = serial_sync_->pico_to_ros_time(timestamp_us);
 
-    reusable_imu_msg_.linear_acceleration.x = ax;
-    reusable_imu_msg_.linear_acceleration.y = ay;
-    reusable_imu_msg_.linear_acceleration.z = az;
+    msg.linear_acceleration.x = ax;
+    msg.linear_acceleration.y = ay;
+    msg.linear_acceleration.z = az;
 
-    reusable_imu_msg_.angular_velocity.x = gx;
-    reusable_imu_msg_.angular_velocity.y = gy;
-    reusable_imu_msg_.angular_velocity.z = gz;
+    msg.angular_velocity.x = gx;
+    msg.angular_velocity.y = gy;
+    msg.angular_velocity.z = gz;
 
-    imu_pub_->publish(reusable_imu_msg_);
+    {
+        std::lock_guard<std::mutex> lock(imu_queue_mutex_);
+        if (imu_queue_.size() < 20) {
+            imu_queue_.push(std::move(msg));
+        }
+    }
+    imu_queue_cv_.notify_one();
+}
+
+// ============================================================
+// IMU Publish Thread
+// ============================================================
+void CameraDisplayNode::imuPublishThreadLoop() {
+    while (imu_publish_running_ || !imu_queue_.empty()) {
+        std::unique_lock<std::mutex> lock(imu_queue_mutex_);
+        imu_queue_cv_.wait(lock, [this] {
+            return !imu_queue_.empty() || !imu_publish_running_;
+        });
+
+        if (imu_queue_.empty()) {
+            break;
+        }
+
+        sensor_msgs::msg::Imu msg = std::move(imu_queue_.front());
+        imu_queue_.pop();
+        lock.unlock();
+
+        imu_pub_->publish(msg);
+    }
 }
 
 // ============================================================
