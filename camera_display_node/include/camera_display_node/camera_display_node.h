@@ -200,11 +200,13 @@ private:
     // Drop Detection & Offset Correction
     // ============================================================
 
-    // Layer 1: V4L2 buf.timestamp interval detection
+    // Layer 1: Dual-gate drop detection (buf.timestamp + wall-clock)
     bool v4l2_ts_available_{false};
     bool v4l2_ts_probed_{false};
     struct timeval last_v4l2_ts_{0, 0};
     bool last_v4l2_ts_valid_{false};
+    std::chrono::steady_clock::time_point last_dqbuf_wall_;
+    bool last_dqbuf_wall_valid_{false};
 
     // Layer 2: Pipeline latency validation (fallback if buf.timestamp unavailable)
     double latency_ema_ns_{0.0};

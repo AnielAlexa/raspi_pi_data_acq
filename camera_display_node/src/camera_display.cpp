@@ -569,25 +569,36 @@ void CameraDisplayNode::captureThreadLoop() {
         }
 
         if (v4l2_ts_available_ && enable_pico_sync_ && sequence_calibrated_.load()) {
-            if (last_v4l2_ts_valid_) {
-                double interval_ms =
+            if (last_v4l2_ts_valid_ && last_dqbuf_wall_valid_) {
+                double v4l2_interval_ms =
                     (buf.timestamp.tv_sec - last_v4l2_ts_.tv_sec) * 1000.0
                   + (buf.timestamp.tv_usec - last_v4l2_ts_.tv_usec) / 1000.0;
-                // Normal interval ~50ms. Drop → ~100ms+. Threshold at 1.5× period.
-                if (interval_ms > 75.0) {
+                double wall_interval_ms =
+                    std::chrono::duration<double, std::milli>(
+                        callback_start - last_dqbuf_wall_).count();
+                // Dual-gate: BOTH buf.timestamp AND wall-clock must exceed 1.5× period.
+                // Prevents false positives from kernel timestamp jitter under GPU load.
+                if (v4l2_interval_ms > 75.0 && wall_interval_ms > 75.0) {
                     int dropped = std::max(1,
-                        static_cast<int>(std::round(interval_ms / 50.0)) - 1);
+                        static_cast<int>(std::round(wall_interval_ms / 50.0)) - 1);
                     sequence_to_frame_id_offset_ += dropped;
                     interval_drops_detected_ += dropped;
                     RCLCPP_WARN(this->get_logger(),
-                        "V4L2 drop detected: interval=%.1fms, %d frame(s) dropped, "
+                        "V4L2 drop detected: v4l2=%.1fms wall=%.1fms, %d frame(s) dropped, "
                         "offset adjusted to %d",
-                        interval_ms, dropped, sequence_to_frame_id_offset_);
+                        v4l2_interval_ms, wall_interval_ms, dropped,
+                        sequence_to_frame_id_offset_);
+                } else if (v4l2_interval_ms > 75.0) {
+                    RCLCPP_DEBUG(this->get_logger(),
+                        "buf.timestamp glitch (v4l2=%.1fms, wall=%.1fms) — ignored",
+                        v4l2_interval_ms, wall_interval_ms);
                 }
             }
             last_v4l2_ts_ = buf.timestamp;
             last_v4l2_ts_valid_ = true;
         }
+        last_dqbuf_wall_ = callback_start;
+        last_dqbuf_wall_valid_ = true;
 
         // --- Sequence → Frame ID calibration ---
         uint16_t frame_id;
