@@ -78,8 +78,9 @@ private:
     void onTriggerPacket(uint64_t timestamp_us, uint16_t frame_id);
     void onAltimeterPacket(uint64_t timestamp_us, float altitude_m);
 
-    // Publisher thread
+    // Publisher threads
     void publisherThreadLoopMono();
+    void publisherThreadLoopSmall();
 
     // IMU publish thread
     void imuPublishThreadLoop();
@@ -114,6 +115,17 @@ private:
     bool frame_ready_to_publish_mono_;
     std::atomic<bool> publisher_running_mono_;
     sensor_msgs::msg::Image pending_msg_mono_;
+
+    // Small image publisher (6-7 Hz, 320x320 cropped+resized)
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_pub_small_;
+    std::thread publisher_thread_small_;
+    std::mutex publish_mutex_small_;
+    std::condition_variable publish_cv_small_;
+    bool frame_ready_to_publish_small_{false};
+    std::atomic<bool> publisher_running_small_{false};
+    sensor_msgs::msg::Image pending_msg_small_;
+    uint32_t small_pub_counter_{0};
+    static constexpr uint32_t SMALL_PUB_DECIMATION = 3;  // every 3rd frame → ~6.7 Hz
 
     // IMU publish thread (decoupled from serial thread)
     std::thread imu_publish_thread_;

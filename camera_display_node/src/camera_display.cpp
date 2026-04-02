@@ -69,9 +69,20 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     range_qos.reliable();
     range_qos.durability_volatile();
 
+    rclcpp::QoS small_qos(
+    rclcpp::QoSInitialization(
+        RMW_QOS_POLICY_HISTORY_KEEP_LAST,
+        1
+    )
+    );
+    small_qos.best_effort();
+    small_qos.durability_volatile();
+
     // Create publishers
     image_pub_mono_ = this->create_publisher<sensor_msgs::msg::Image>(
         "/camera/image_mono", mono_qos);
+    image_pub_small_ = this->create_publisher<sensor_msgs::msg::Image>(
+        "/camera/image_small", small_qos);
     imu_pub_ = this->create_publisher<sensor_msgs::msg::Imu>(
         "/imu/data_raw", imu_qos);
     range_pub_ = this->create_publisher<sensor_msgs::msg::Range>(
@@ -99,6 +110,9 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     pending_msg_mono_ = reusable_msg_mono_;
     pending_msg_mono_.data.resize(frame_size_mono);
 
+    pending_msg_small_ = reusable_msg_mono_;
+    pending_msg_small_.data.resize(frame_size_mono);
+
     // Start event-driven publisher thread
     publisher_running_mono_ = true;
     frame_ready_to_publish_mono_ = false;
@@ -122,6 +136,10 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     } else {
         RCLCPP_INFO(this->get_logger(), "Publisher thread set to SCHED_FIFO priority 48");
     }
+
+    // Start small-image publisher thread (non-RT, not critical)
+    publisher_running_small_ = true;
+    publisher_thread_small_ = std::thread(&CameraDisplayNode::publisherThreadLoopSmall, this);
 
     // Start capture thread with real-time priority to minimize jitter
     capture_running_ = true;
@@ -239,12 +257,19 @@ CameraDisplayNode::~CameraDisplayNode() {
         }
     }
 
-    // Stop publisher thread
+    // Stop publisher threads
     if (publisher_running_mono_) {
         publisher_running_mono_ = false;
         publish_cv_mono_.notify_one();
         if (publisher_thread_mono_.joinable()) {
             publisher_thread_mono_.join();
+        }
+    }
+    if (publisher_running_small_) {
+        publisher_running_small_ = false;
+        publish_cv_small_.notify_one();
+        if (publisher_thread_small_.joinable()) {
+            publisher_thread_small_.join();
         }
     }
 
@@ -803,6 +828,17 @@ void CameraDisplayNode::captureThreadLoop() {
             ae_cv_.notify_one();
         }
 
+        // --- Notify small-image publisher every Nth frame (before mono swap) ---
+        if (++small_pub_counter_ % SMALL_PUB_DECIMATION == 0) {
+            std::lock_guard<std::mutex> lock(publish_mutex_small_);
+            pending_msg_small_.header = reusable_msg_mono_.header;
+            std::memcpy(pending_msg_small_.data.data(),
+                        reusable_msg_mono_.data.data(),
+                        reusable_msg_mono_.data.size());
+            frame_ready_to_publish_small_ = true;
+            publish_cv_small_.notify_one();
+        }
+
         // --- Notify publisher ---
         {
             std::lock_guard<std::mutex> lock(publish_mutex_mono_);
@@ -1092,6 +1128,49 @@ void CameraDisplayNode::publisherThreadLoopMono() {
             image_pub_mono_->publish(local_msg);
             publish_time_mono_us_ = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - publish_start).count() * 1e6;
+        }
+    }
+}
+
+// ============================================================
+// Small Image Publisher Thread Loop (~6.7 Hz, 320x320 crop+resize)
+// ============================================================
+void CameraDisplayNode::publisherThreadLoopSmall() {
+    sensor_msgs::msg::Image local_full;
+    local_full.data.resize(static_cast<size_t>(width_) * static_cast<size_t>(height_));
+
+    sensor_msgs::msg::Image out_msg;
+    out_msg.header.frame_id = "camera_link";
+    out_msg.encoding = "mono8";
+    out_msg.is_bigendian = false;
+    out_msg.width = 320;
+    out_msg.height = 320;
+    out_msg.step = 320;
+    out_msg.data.resize(320 * 320);
+
+    while (publisher_running_small_) {
+        std::unique_lock<std::mutex> lock(publish_mutex_small_);
+        publish_cv_small_.wait(lock, [this] {
+            return frame_ready_to_publish_small_ || !publisher_running_small_;
+        });
+        if (!publisher_running_small_) break;
+
+        if (frame_ready_to_publish_small_) {
+            std::swap(local_full, pending_msg_small_);
+            frame_ready_to_publish_small_ = false;
+            lock.unlock();
+
+            // Center crop 1280x720 → 720x720
+            int crop_x = (width_ - height_) / 2;
+            cv::Mat full(height_, width_, CV_8UC1, local_full.data.data());
+            cv::Mat cropped = full(cv::Rect(crop_x, 0, height_, height_));
+
+            // Resize 720x720 → 320x320
+            cv::Mat small_mat(320, 320, CV_8UC1, out_msg.data.data());
+            cv::resize(cropped, small_mat, small_mat.size(), 0, 0, cv::INTER_AREA);
+
+            out_msg.header.stamp = local_full.header.stamp;
+            image_pub_small_->publish(out_msg);
         }
     }
 }
