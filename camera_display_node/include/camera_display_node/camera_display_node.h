@@ -197,6 +197,29 @@ private:
     std::atomic<uint32_t> frame_drops_;
 
     // ============================================================
+    // Drop Detection & Offset Correction
+    // ============================================================
+
+    // Layer 1: V4L2 buf.timestamp interval detection
+    bool v4l2_ts_available_{false};
+    bool v4l2_ts_probed_{false};
+    struct timeval last_v4l2_ts_{0, 0};
+    bool last_v4l2_ts_valid_{false};
+
+    // Layer 2: Pipeline latency validation (fallback if buf.timestamp unavailable)
+    double latency_ema_ns_{0.0};
+    bool latency_baseline_valid_{false};
+    uint32_t latency_warmup_count_{0};
+    static constexpr uint32_t LATENCY_WARMUP_FRAMES = 60;
+    static constexpr double LATENCY_EMA_ALPHA = 0.02;
+    static constexpr double LATENCY_WARMUP_ALPHA = 0.1;
+    static constexpr double LATENCY_JUMP_THRESHOLD_NS = 30'000'000.0;  // 30ms
+
+    // Shared counters
+    std::atomic<uint32_t> latency_corrections_{0};
+    std::atomic<uint32_t> interval_drops_detected_{0};
+
+    // ============================================================
     // Performance Metrics
     // ============================================================
     double callback_time_us_;

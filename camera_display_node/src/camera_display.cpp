@@ -559,6 +559,36 @@ void CameraDisplayNode::captureThreadLoop() {
 
         frames_received_++;
 
+        // --- V4L2 buf.timestamp probe & drop detection (Layer 1) ---
+        if (!v4l2_ts_probed_) {
+            v4l2_ts_probed_ = true;
+            v4l2_ts_available_ = (buf.timestamp.tv_sec != 0 || buf.timestamp.tv_usec != 0);
+            RCLCPP_INFO(this->get_logger(), "V4L2 buf.timestamp %s",
+                        v4l2_ts_available_ ? "available — using for drop detection"
+                                           : "not populated by driver");
+        }
+
+        if (v4l2_ts_available_ && enable_pico_sync_ && sequence_calibrated_.load()) {
+            if (last_v4l2_ts_valid_) {
+                double interval_ms =
+                    (buf.timestamp.tv_sec - last_v4l2_ts_.tv_sec) * 1000.0
+                  + (buf.timestamp.tv_usec - last_v4l2_ts_.tv_usec) / 1000.0;
+                // Normal interval ~50ms. Drop → ~100ms+. Threshold at 1.5× period.
+                if (interval_ms > 75.0) {
+                    int dropped = std::max(1,
+                        static_cast<int>(std::round(interval_ms / 50.0)) - 1);
+                    sequence_to_frame_id_offset_ += dropped;
+                    interval_drops_detected_ += dropped;
+                    RCLCPP_WARN(this->get_logger(),
+                        "V4L2 drop detected: interval=%.1fms, %d frame(s) dropped, "
+                        "offset adjusted to %d",
+                        interval_ms, dropped, sequence_to_frame_id_offset_);
+                }
+            }
+            last_v4l2_ts_ = buf.timestamp;
+            last_v4l2_ts_valid_ = true;
+        }
+
         // --- Sequence → Frame ID calibration ---
         uint16_t frame_id;
         if (enable_pico_sync_) {
@@ -581,8 +611,9 @@ void CameraDisplayNode::captureThreadLoop() {
         }
 
         // --- Frame drop detection (via V4L2 sequence gaps) ---
-        // Use buf.sequence directly — it skips monotonically when V4L2 drops a frame,
-        // which leaves the frame_id mapping intact (both sides skip the same frame).
+        // NOTE: On the Arducam JetVariety driver, buf.sequence does NOT skip for
+        // dropped frames. The buf.timestamp interval detector (Layer 1) or the
+        // pipeline latency validator (Layer 2) handles offset correction instead.
         if (last_v4l2_sequence_valid_) {
             uint32_t gap = buf.sequence - last_v4l2_sequence_;
             if (gap > 1) {
@@ -614,16 +645,20 @@ void CameraDisplayNode::captureThreadLoop() {
                 uint32_t matched = frames_matched_.load();
                 uint32_t received = frames_received_.load();
                 double match_rate = (received > 0) ? (100.0 * matched / received) : 0.0;
+                uint32_t int_drops = interval_drops_detected_.load();
+                uint32_t lat_corr = latency_corrections_.load();
                 if (ae_enabled_) {
                     RCLCPP_INFO(this->get_logger(),
-                               "FPS: %.1f | Mean: %.0f Exp: %d | Sync: %.0f%% | CB: %.0fµs [Conv:%.0f] | Mono: %.0fµs",
+                               "FPS: %.1f | Mean: %.0f Exp: %d | Sync: %.0f%% | Drops: %u+%u | CB: %.0fµs [Conv:%.0f] | Mono: %.0fµs",
                                smoothed_fps_, ae_current_mean_, current_exposure_.load(),
-                               match_rate, callback_time_us_,
+                               match_rate, int_drops, lat_corr,
+                               callback_time_us_,
                                convert_time_us_, publish_time_mono_us_);
                 } else {
                     RCLCPP_INFO(this->get_logger(),
-                               "FPS: %.1f | Sync: %.0f%% | CB: %.0fµs [Conv:%.0f] | Mono: %.0fµs",
-                               smoothed_fps_, match_rate, callback_time_us_,
+                               "FPS: %.1f | Sync: %.0f%% | Drops: %u+%u | CB: %.0fµs [Conv:%.0f] | Mono: %.0fµs",
+                               smoothed_fps_, match_rate, int_drops, lat_corr,
+                               callback_time_us_,
                                convert_time_us_, publish_time_mono_us_);
                 }
             } else {
@@ -678,6 +713,36 @@ void CameraDisplayNode::captureThreadLoop() {
                         RCLCPP_INFO(this->get_logger(),
                                    "Calibration validated: %.0f%% hit rate over %u frames",
                                    hit_rate * 100.0, CALIBRATION_VALIDATION_COUNT);
+                    }
+                }
+            }
+
+            // --- Layer 2: Pipeline latency EMA update (when buf.timestamp unavailable) ---
+            if (!v4l2_ts_available_ && hit &&
+                calibration_validation_frames_ >= CALIBRATION_VALIDATION_COUNT)
+            {
+                double latency_ns = static_cast<double>(
+                    (this->now() - frame_timestamp).nanoseconds());
+
+                if (!latency_baseline_valid_) {
+                    latency_warmup_count_++;
+                    if (latency_ema_ns_ == 0.0) {
+                        latency_ema_ns_ = latency_ns;
+                    } else {
+                        latency_ema_ns_ += LATENCY_WARMUP_ALPHA *
+                            (latency_ns - latency_ema_ns_);
+                    }
+                    if (latency_warmup_count_ >= LATENCY_WARMUP_FRAMES) {
+                        latency_baseline_valid_ = true;
+                        RCLCPP_INFO(this->get_logger(),
+                            "Latency baseline converged: %.2f ms",
+                            latency_ema_ns_ / 1e6);
+                    }
+                } else {
+                    double deviation = std::abs(latency_ns - latency_ema_ns_);
+                    if (deviation < LATENCY_JUMP_THRESHOLD_NS) {
+                        latency_ema_ns_ += LATENCY_EMA_ALPHA *
+                            (latency_ns - latency_ema_ns_);
                     }
                 }
             }
@@ -899,12 +964,50 @@ void CameraDisplayNode::onTriggerPacket(uint64_t timestamp_us, uint16_t frame_id
 rclcpp::Time CameraDisplayNode::getFrameTimestamp(uint16_t frame_id) {
     std::lock_guard<std::mutex> lock(trigger_map_mutex_);
     auto it = trigger_map_.find(frame_id);
-    if (it != trigger_map_.end()) {
-        rclcpp::Time t = it->second;
-        trigger_map_.erase(it);
-        return t;
+    if (it == trigger_map_.end()) {
+        return rclcpp::Time(0, 0, RCL_ROS_TIME);
     }
-    return rclcpp::Time(0, 0, RCL_ROS_TIME);
+
+    rclcpp::Time candidate = it->second;
+
+    // Layer 2: latency validation (only when buf.timestamp is unavailable)
+    if (!v4l2_ts_available_ && latency_baseline_valid_) {
+        double latency_ns = static_cast<double>(
+            (this->now() - candidate).nanoseconds());
+        double deviation = latency_ns - latency_ema_ns_;
+
+        if (deviation > LATENCY_JUMP_THRESHOLD_NS) {
+            // Latency anomalously high — try adjacent frame_ids
+            for (int shift = 1; shift <= 3; ++shift) {
+                uint16_t trial_id = static_cast<uint16_t>(
+                    (frame_id + shift) & 0xFFFF);
+                auto trial_it = trigger_map_.find(trial_id);
+                if (trial_it != trigger_map_.end()) {
+                    double trial_latency = static_cast<double>(
+                        (this->now() - trial_it->second).nanoseconds());
+                    double trial_dev = std::abs(trial_latency - latency_ema_ns_);
+                    if (trial_dev < std::abs(deviation) * 0.5) {
+                        // Better match — correct offset and use it
+                        rclcpp::Time corrected = trial_it->second;
+                        trigger_map_.erase(it);        // stale entry
+                        trigger_map_.erase(trial_it);  // consumed entry
+                        sequence_to_frame_id_offset_ += shift;
+                        latency_corrections_++;
+                        latency_baseline_valid_ = false;
+                        latency_warmup_count_ = 0;
+                        latency_ema_ns_ = 0.0;
+                        RCLCPP_WARN(this->get_logger(),
+                            "Latency correction: shift=+%d, new offset=%d",
+                            shift, sequence_to_frame_id_offset_);
+                        return corrected;
+                    }
+                }
+            }
+        }
+    }
+
+    trigger_map_.erase(it);
+    return candidate;
 }
 
 // ============================================================
@@ -914,7 +1017,9 @@ void CameraDisplayNode::logSyncStats() {
     RCLCPP_INFO(this->get_logger(), "=== Synchronization Statistics ===");
     RCLCPP_INFO(this->get_logger(), "Total frames received: %u", frames_received_.load());
     RCLCPP_INFO(this->get_logger(), "Frames matched to trigger: %u", frames_matched_.load());
-    RCLCPP_INFO(this->get_logger(), "Frame drops detected: %u", frame_drops_.load());
+    RCLCPP_INFO(this->get_logger(), "Frame drops detected (seq): %u, (interval): %u",
+               frame_drops_.load(), interval_drops_detected_.load());
+    RCLCPP_INFO(this->get_logger(), "Latency corrections: %u", latency_corrections_.load());
     RCLCPP_INFO(this->get_logger(), "Frames skipped (publisher busy): %u",
                frames_skipped_mono_.load());
     RCLCPP_INFO(this->get_logger(), "Slow callbacks (>5ms): %u", slow_callbacks_.load());
