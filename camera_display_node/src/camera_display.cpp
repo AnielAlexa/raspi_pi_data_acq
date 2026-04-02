@@ -888,9 +888,12 @@ void CameraDisplayNode::onImuPacket(uint64_t timestamp_us, float ax, float ay, f
 
     {
         std::lock_guard<std::mutex> lock(imu_queue_mutex_);
-        if (imu_queue_.size() < 20) {
-            imu_queue_.push(std::move(msg));
+        if (imu_queue_.size() >= 200) {
+            imu_queue_.pop();  // drop oldest
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "IMU queue overflow (200) — dropping oldest sample");
         }
+        imu_queue_.push(std::move(msg));
     }
     imu_queue_cv_.notify_one();
 }
@@ -899,21 +902,26 @@ void CameraDisplayNode::onImuPacket(uint64_t timestamp_us, float ax, float ay, f
 // IMU Publish Thread
 // ============================================================
 void CameraDisplayNode::imuPublishThreadLoop() {
-    while (imu_publish_running_ || !imu_queue_.empty()) {
-        std::unique_lock<std::mutex> lock(imu_queue_mutex_);
-        imu_queue_cv_.wait(lock, [this] {
-            return !imu_queue_.empty() || !imu_publish_running_;
-        });
+    std::vector<sensor_msgs::msg::Imu> batch;
+    batch.reserve(32);
 
-        if (imu_queue_.empty()) {
-            break;
+    while (imu_publish_running_ || !imu_queue_.empty()) {
+        {
+            std::unique_lock<std::mutex> lock(imu_queue_mutex_);
+            imu_queue_cv_.wait(lock, [this] {
+                return !imu_queue_.empty() || !imu_publish_running_;
+            });
+
+            while (!imu_queue_.empty()) {
+                batch.push_back(std::move(imu_queue_.front()));
+                imu_queue_.pop();
+            }
         }
 
-        sensor_msgs::msg::Imu msg = std::move(imu_queue_.front());
-        imu_queue_.pop();
-        lock.unlock();
-
-        imu_pub_->publish(msg);
+        for (auto& msg : batch) {
+            imu_pub_->publish(msg);
+        }
+        batch.clear();
     }
 }
 
