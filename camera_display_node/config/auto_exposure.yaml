@@ -2,7 +2,7 @@
 # Edit values and restart the node to apply (no rebuild needed).
 enabled: true
 target_mean: 110
-kp: 0.3
+kp: 0.15
 deadband: 3.0
 min_exposure: 1
 max_exposure: 4111
