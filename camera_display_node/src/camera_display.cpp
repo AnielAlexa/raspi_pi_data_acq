@@ -82,7 +82,7 @@ CameraDisplayNode::CameraDisplayNode() : Node("camera_display_node"),
     image_pub_mono_ = this->create_publisher<sensor_msgs::msg::Image>(
         "/camera/image_mono", mono_qos);
     image_pub_small_ = this->create_publisher<sensor_msgs::msg::Image>(
-        "/camera/image_small", small_qos);
+        "/camera/image_pf", small_qos);
     imu_pub_ = this->create_publisher<sensor_msgs::msg::Imu>(
         "/imu/data_raw", imu_qos);
     range_pub_ = this->create_publisher<sensor_msgs::msg::Range>(
@@ -1133,9 +1133,12 @@ void CameraDisplayNode::publisherThreadLoopMono() {
 }
 
 // ============================================================
-// Small Image Publisher Thread Loop (~6.7 Hz, 320x320 crop+resize)
+// Small Image Publisher Thread Loop (10 Hz, 512x288 resize)
 // ============================================================
 void CameraDisplayNode::publisherThreadLoopSmall() {
+    constexpr int kSmallW = 512;
+    constexpr int kSmallH = 288;
+
     sensor_msgs::msg::Image local_full;
     local_full.data.resize(static_cast<size_t>(width_) * static_cast<size_t>(height_));
 
@@ -1143,10 +1146,10 @@ void CameraDisplayNode::publisherThreadLoopSmall() {
     out_msg.header.frame_id = "camera_link";
     out_msg.encoding = "mono8";
     out_msg.is_bigendian = false;
-    out_msg.width = 320;
-    out_msg.height = 320;
-    out_msg.step = 320;
-    out_msg.data.resize(320 * 320);
+    out_msg.width = kSmallW;
+    out_msg.height = kSmallH;
+    out_msg.step = kSmallW;
+    out_msg.data.resize(static_cast<size_t>(kSmallW) * static_cast<size_t>(kSmallH));
 
     while (publisher_running_small_) {
         std::unique_lock<std::mutex> lock(publish_mutex_small_);
@@ -1160,14 +1163,9 @@ void CameraDisplayNode::publisherThreadLoopSmall() {
             frame_ready_to_publish_small_ = false;
             lock.unlock();
 
-            // Center crop 1280x720 → 720x720
-            int crop_x = (width_ - height_) / 2;
             cv::Mat full(height_, width_, CV_8UC1, local_full.data.data());
-            cv::Mat cropped = full(cv::Rect(crop_x, 0, height_, height_));
-
-            // Resize 720x720 → 320x320
-            cv::Mat small_mat(320, 320, CV_8UC1, out_msg.data.data());
-            cv::resize(cropped, small_mat, small_mat.size(), 0, 0, cv::INTER_AREA);
+            cv::Mat small_mat(kSmallH, kSmallW, CV_8UC1, out_msg.data.data());
+            cv::resize(full, small_mat, small_mat.size(), 0, 0, cv::INTER_AREA);
 
             out_msg.header.stamp = local_full.header.stamp;
             image_pub_small_->publish(out_msg);

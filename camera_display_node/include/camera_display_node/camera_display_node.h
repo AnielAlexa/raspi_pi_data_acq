@@ -125,7 +125,7 @@ private:
     std::atomic<bool> publisher_running_small_{false};
     sensor_msgs::msg::Image pending_msg_small_;
     uint32_t small_pub_counter_{0};
-    static constexpr uint32_t SMALL_PUB_DECIMATION = 3;  // every 3rd frame → ~6.7 Hz
+    static constexpr uint32_t SMALL_PUB_DECIMATION = 2;  // every 2nd frame → 10 Hz
 
     // IMU publish thread (decoupled from serial thread)
     std::thread imu_publish_thread_;
